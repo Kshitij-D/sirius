@@ -37,6 +37,9 @@
 #include <data/data_batch_utils.hpp>
 
 #include <cstdint>
+#include <mutex>
+#include <cstdlib>
+#include <cstdio>
 #include <format>
 #include <limits>
 #include <optional>
@@ -638,6 +641,36 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     }
     auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
     global.get_memory_history().record({input_basis, peak_bytes, output_bytes});
+    // Experimental (env-gated): per-task estimate vs actual, for the admission study.
+    static std::string const tasklog_path = [] {
+      auto const* v = std::getenv("SIRIUS_TASKLOG");
+      return std::string(v ? v : "");
+    }();
+    if (!tasklog_path.empty()) {
+      static std::mutex tasklog_mutex;
+      std::string ops;
+      for (auto& op_ref : pipeline->get_operators()) {
+        if (!ops.empty()) { ops += '>'; }
+        ops += op_ref.get().get_name();
+      }
+      auto const& info = local_state.get_reservation_size_info();
+      std::lock_guard<std::mutex> lock(tasklog_mutex);
+      if (std::FILE* f = std::fopen(tasklog_path.c_str(), "a")) {
+        std::fprintf(f,
+                     "%u\t%zu\t%llu\t%zu\t%zu\t%d\t%zu\t%zu\t%zu\t%s\n",
+                     sirius::value_of(pipeline->get_query_id()),
+                     pipeline->get_pipeline_id(),
+                     static_cast<unsigned long long>(_task_id),
+                     input_basis,
+                     info->peak_memory_estimate,
+                     info->had_history ? 1 : 0,
+                     static_cast<std::size_t>(reservation_bytes),
+                     static_cast<std::size_t>(peak_bytes),
+                     output_bytes,
+                     ops.c_str());
+        std::fclose(f);
+      }
+    }
     SIRIUS_LOG_TRACE(
       "[GPU:{}] Pipeline {}: memory history record - task={}, input_basis={}, output_bytes={}, "
       "reservation_bytes={}, peak_bytes={}, peak_bytes_to_materialize_input={}",
