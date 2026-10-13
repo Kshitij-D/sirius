@@ -29,6 +29,8 @@
 #include <nvtx3/nvtx3.hpp>
 #include <thrust/system/system_error.h>
 
+#include "memory/query_memory_ledger.hpp"
+
 #include <absl/cleanup/cleanup.h>
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/error.hpp>
@@ -530,6 +532,12 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     stream, std::move(reservation), nullptr, std::make_unique<memory::defragmenter_oom_policy>());
   absl::Cleanup source_closer = [allocator, stream]() {
     allocator->reset_stream_reservation(stream);
+  };
+  // Per-query ledger of engine-committed GPU bytes (admission study).
+  auto const ledger_query = sirius::value_of(pipeline->get_query_id());
+  sirius::memory::query_memory_ledger::instance().add(ledger_query, reservation_bytes);
+  absl::Cleanup ledger_release = [ledger_query, reservation_bytes]() {
+    sirius::memory::query_memory_ledger::instance().sub(ledger_query, reservation_bytes);
   };
 
   if (!local_state._input_data) {

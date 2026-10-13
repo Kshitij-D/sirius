@@ -65,6 +65,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include "memory/query_memory_ledger.hpp"
 #include <chrono>
 #include <cstddef>
 #include <cstdio>   // for fprintf/fileno (fallback banner)
@@ -919,6 +920,7 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
   }
 
   ctx_.acquire_query_lifecycle_slot(&context);
+  note_window_query(sirius::value_of(window_id_));
   log_window_event("begin", "-");
   try {
     // SNAPSHOT-AT-WINDOW-BEGIN (E1/E2): this query sees the SET-mutable config
@@ -1043,6 +1045,11 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   if (auto const* v = std::getenv("SIRIUS_ADMIT_FOOTPRINTS")) {
     load_footprints(v);
     preadmit_ = admit_gpu_bytes_ > 0;
+  }
+  if (auto const* v = std::getenv("SIRIUS_QUERYLOG")) { querylog_path_ = v; }
+  if (auto const* v = std::getenv("SIRIUS_ADMIT_LEARNED")) {
+    admit_learned_scale_ = std::stod(v);
+    preadmit_            = admit_gpu_bytes_ > 0 && admit_learned_scale_ > 0;
   }
   if (auto const* v = std::getenv("SIRIUS_ADMIT_STRUCTURAL")) {
     admit_structural_scale_ = std::stod(v);
@@ -2165,6 +2172,11 @@ struct window_info {
   bool started_alone{false};
   std::string query_head;
   plan_footprint_features features;
+  std::uint32_t query_id{0};
+  bool learned{false};
+  int peers_at_admit{0};
+  std::chrono::steady_clock::time_point wait_start{};
+  std::chrono::steady_clock::time_point admitted{};
 };
 thread_local window_info t_window;
 thread_local plan_footprint_features t_pending_features;
@@ -2198,7 +2210,7 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
 
   std::uint64_t fingerprint = 0;
   std::string query_head;
-  if (context != nullptr && (!footprint_log_path_.empty() || preadmit_)) {
+  if (context != nullptr && (!footprint_log_path_.empty() || preadmit_ || !querylog_path_.empty())) {
     try {
       auto const& q = context->GetCurrentQuery();
       fingerprint   = query_fingerprint(q);
@@ -2227,8 +2239,18 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
     }
   }
 
+  auto const wait_start = std::chrono::steady_clock::now();
+  bool learned          = false;
   {
     std::unique_lock<std::mutex> lock(query_lifecycle_mutex_);
+    if (preadmit_ && admit_learned_scale_ > 0 && fingerprint != 0) {
+      auto it = learned_peaks_.find(fingerprint);
+      if (it != learned_peaks_.end() && !it->second.empty()) {
+        projected = static_cast<std::size_t>(
+          admit_learned_scale_ * *std::max_element(it->second.begin(), it->second.end()));
+        learned = true;
+      }
+    }
     if (admit_gpu_bytes_ == 0) {
       query_lifecycle_cv_.wait(lock,
                                [this] { return query_lifecycle_active_ < query_lifecycle_slots_; });
@@ -2262,6 +2284,10 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
     }
     t_window = window_info{fingerprint, projected, ++admissions_, gpu_allocated_bytes(),
                            query_lifecycle_active_ == 0, std::move(query_head), features};
+    t_window.learned        = learned;
+    t_window.peers_at_admit = query_lifecycle_active_;
+    t_window.wait_start     = wait_start;
+    t_window.admitted       = std::chrono::steady_clock::now();
     live_projected_bytes_ += preadmit_ ? projected : 0;
     ++query_lifecycle_active_;
     if (query_lifecycle_active_ > query_lifecycle_peak_.load(std::memory_order_relaxed)) {
@@ -2286,13 +2312,22 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
 
 void SiriusContext::release_query_lifecycle_slot() noexcept
 {
-  bool solo           = false;
-  std::size_t peak_up = 0;
+  bool solo               = false;
+  std::size_t peak_up     = 0;
+  std::size_t engine_peak = 0;
   {
     std::lock_guard<std::mutex> lock(query_lifecycle_mutex_);
     if (preadmit_) { live_projected_bytes_ -= std::min(live_projected_bytes_, t_window.projected); }
     // Solo window: started with nothing live and nobody was admitted since.
     solo = t_window.started_alone && admissions_ == t_window.admission_seq;
+    if (t_window.query_id != 0) {
+      engine_peak = sirius::memory::query_memory_ledger::instance().take_peak(t_window.query_id);
+      if (engine_peak > 0 && t_window.fingerprint != 0) {
+        auto& hist = learned_peaks_[t_window.fingerprint];
+        hist.push_back(engine_peak);
+        if (hist.size() > 3) { hist.erase(hist.begin()); }
+      }
+    }
     if (solo && !footprint_log_path_.empty()) {
       auto peak = gpu_peak_bytes();
       peak_up   = peak > t_window.start_alloc ? peak - t_window.start_alloc : 0;
@@ -2320,8 +2355,39 @@ void SiriusContext::release_query_lifecycle_slot() noexcept
     } catch (...) {
     }
   }
+  if (!querylog_path_.empty() && t_window.fingerprint != 0) {
+    try {
+      using namespace std::chrono;
+      auto const now  = steady_clock::now();
+      double wait_ms  = duration<double, std::milli>(t_window.admitted - t_window.wait_start).count();
+      double run_ms   = duration<double, std::milli>(now - t_window.admitted).count();
+      double wall     = duration<double>(system_clock::now().time_since_epoch()).count();
+      std::lock_guard<std::mutex> lock(footprint_log_mutex_);
+      if (std::FILE* f = std::fopen(querylog_path_.c_str(), "a")) {
+        std::fprintf(f,
+                     "%016llx\t%.4f\t%.3f\t%.3f\t%zu\t%d\t%zu\t%d\t%d\t%s\n",
+                     static_cast<unsigned long long>(t_window.fingerprint),
+                     wall,
+                     wait_ms,
+                     run_ms,
+                     t_window.projected,
+                     t_window.learned ? 1 : 0,
+                     engine_peak,
+                     t_window.peers_at_admit,
+                     solo ? 1 : 0,
+                     t_window.query_head.c_str());
+        std::fclose(f);
+      }
+    } catch (...) {
+    }
+  }
   t_window = window_info{};
   query_lifecycle_cv_.notify_one();
+}
+
+void SiriusContext::note_window_query(std::uint32_t query_id) noexcept
+{
+  t_window.query_id = query_id;
 }
 
 std::size_t SiriusContext::gpu_allocated_bytes() const

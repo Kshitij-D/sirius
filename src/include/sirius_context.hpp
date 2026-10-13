@@ -950,6 +950,12 @@ class SiriusContext : public ClientContextState {
   //                           max(allocated, idle level + live projections)
   //                           + this query's projection <= ADMIT_GPU_BYTES.
   //   SIRIUS_ADMIT_DEFAULT_BYTES projection for queries without a footprint.
+  //   SIRIUS_ADMIT_LEARNED <scale>: projection = scale * the max engine-ledger
+  //                           peak of the template's last runs (Sirius's own
+  //                           task reservations, summed per query); unseen
+  //                           templates fall back to the other sources.
+  //   SIRIUS_QUERYLOG         TSV: per window fingerprint, wait, run time,
+  //                           projection, engine peak, live peers at admission.
   //   SIRIUS_ADMIT_STRUCTURAL <scale>: projection = scale * need_fast from the
   //                           plan walk (precedence over coefs and footprints).
   //   SIRIUS_ADMIT_PLAN_COEFS "c0,c1..c8": query-aware projection from plan
@@ -969,6 +975,16 @@ class SiriusContext : public ClientContextState {
   std::mutex footprint_log_mutex_;
   std::vector<double> plan_coefs_;
   double admit_structural_scale_{0};
+  double admit_learned_scale_{0};  // SIRIUS_ADMIT_LEARNED
+  // fingerprint -> last few engine-ledger peaks; guarded by query_lifecycle_mutex_
+  std::unordered_map<std::uint64_t, std::vector<std::size_t>> learned_peaks_;
+  std::string querylog_path_;  // SIRIUS_QUERYLOG
+
+ public:
+  /// Tell the admission bookkeeping which Sirius query id the current window runs.
+  static void note_window_query(std::uint32_t query_id) noexcept;
+
+ private:
   void load_footprints(std::string const& path);
 
  public:
