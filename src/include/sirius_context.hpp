@@ -245,6 +245,11 @@ struct plan_footprint_features {
   // join outputs, aggregate state, sort/top-n inputs, unfiltered base-table
   // bytes of the scanned columns, and the same capped per scan at one batch
   double f[k_count]{};
+  // Structural estimates (no fitted weights): peak over the plan of working
+  // batches plus live join/aggregate/sort state (need_fast), and working
+  // batches alone, i.e. with all state downgraded (need_min).
+  double need_fast{0};
+  double need_min{0};
   bool valid{false};
 };
 
@@ -945,6 +950,8 @@ class SiriusContext : public ClientContextState {
   //                           max(allocated, idle level + live projections)
   //                           + this query's projection <= ADMIT_GPU_BYTES.
   //   SIRIUS_ADMIT_DEFAULT_BYTES projection for queries without a footprint.
+  //   SIRIUS_ADMIT_STRUCTURAL <scale>: projection = scale * need_fast from the
+  //                           plan walk (precedence over coefs and footprints).
   //   SIRIUS_ADMIT_PLAN_COEFS "c0,c1..c8": query-aware projection from plan
   //                           features (c0 + sum ci*fi); takes precedence over
   //                           measured footprints when the plan is available.
@@ -961,6 +968,7 @@ class SiriusContext : public ClientContextState {
   std::string footprint_log_path_;
   std::mutex footprint_log_mutex_;
   std::vector<double> plan_coefs_;
+  double admit_structural_scale_{0};
   void load_footprints(std::string const& path);
 
  public:

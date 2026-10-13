@@ -208,6 +208,88 @@ void accumulate_features(duckdb::LogicalOperator& op,
   }
 }
 
+// Structural peak-memory walk over the logical plan. Sizes are DuckDB's
+// estimates; shape and constants come from how Sirius executes:
+//  - a scan pipeline keeps up to `threads` batches in flight, each costing 2x its
+//    bytes (Sirius's no-history per-operator default);
+//  - a join's hash table (~2x build bytes) lives while its probe side runs;
+//  - an aggregate holds ~2x its group bytes while its input streams, then its
+//    result stays materialized for the parent;
+//  - a sort holds ~2x its input.
+struct walk_result {
+  double peak{0};   // need_fast: working + live state
+  double work{0};   // need_min: working batches only
+  double held{0};   // bytes materialized for the parent
+};
+
+walk_result walk_peak(duckdb::LogicalOperator& op,
+                      duckdb::ClientContext& ctx,
+                      double batch_bytes,
+                      double threads)
+{
+  using T = duckdb::LogicalOperatorType;
+  auto bytes_of = [&](duckdb::LogicalOperator& o) { return card(o, ctx) * row_width(o.types); };
+  switch (op.type) {
+    case T::LOGICAL_GET: {
+      double base = bytes_of(op);
+      auto& get   = op.Cast<duckdb::LogicalGet>();
+      if (get.function.cardinality) {
+        auto stats = get.function.cardinality(ctx, get.bind_data.get());
+        if (stats && stats->has_estimated_cardinality) {
+          duckdb::vector<duckdb::LogicalType> read_types;
+          for (auto const& col : get.GetColumnIds()) {
+            if (col.IsVirtualColumn()) { continue; }
+            auto idx = col.GetPrimaryIndex();
+            if (idx < get.returned_types.size()) { read_types.push_back(get.returned_types[idx]); }
+          }
+          base = static_cast<double>(stats->estimated_cardinality) * row_width(read_types);
+        }
+      }
+      double in_flight = std::min(base, threads * batch_bytes);
+      double w         = 2 * in_flight;
+      return {w, w, 0};
+    }
+    case T::LOGICAL_COMPARISON_JOIN:
+    case T::LOGICAL_DELIM_JOIN:
+    case T::LOGICAL_ANY_JOIN:
+    case T::LOGICAL_ASOF_JOIN:
+    case T::LOGICAL_CROSS_PRODUCT: {
+      if (op.children.size() != 2) { break; }
+      auto build = walk_peak(*op.children[1], ctx, batch_bytes, threads);
+      auto probe = walk_peak(*op.children[0], ctx, batch_bytes, threads);
+      double ht  = 2 * bytes_of(*op.children[1]);
+      return {std::max(build.peak, ht + probe.peak), std::max(build.work, probe.work), 0};
+    }
+    case T::LOGICAL_AGGREGATE_AND_GROUP_BY:
+    case T::LOGICAL_WINDOW: {
+      if (op.children.empty()) { break; }
+      auto in    = walk_peak(*op.children[0], ctx, batch_bytes, threads);
+      double out = bytes_of(op);
+      return {in.peak + 2 * out, in.work, out};
+    }
+    case T::LOGICAL_ORDER_BY:
+    case T::LOGICAL_TOP_N: {
+      if (op.children.empty()) { break; }
+      auto in     = walk_peak(*op.children[0], ctx, batch_bytes, threads);
+      double data = bytes_of(*op.children[0]);
+      if (op.type == T::LOGICAL_TOP_N) { data = std::min(data, threads * batch_bytes); }
+      return {in.peak + 2 * data, in.work, data};
+    }
+    default: break;
+  }
+  // Streaming operators: children run one after another; held results add up.
+  walk_result r;
+  double held_before = 0;
+  for (auto& child : op.children) {
+    auto c = walk_peak(*child, ctx, batch_bytes, threads);
+    r.peak = std::max(r.peak, held_before + c.peak);
+    r.work = std::max(r.work, c.work);
+    held_before += c.held;
+  }
+  r.held = held_before;
+  return r;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -270,6 +352,14 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
               std::lock_guard<std::mutex> lock(resolve_mutex);
               logical_plan_->ResolveOperatorTypes();
               accumulate_features(*logical_plan_, context.client, features);
+              auto const& cfg = state.sirius_context->get_config();
+              auto const w    = walk_peak(
+                *logical_plan_,
+                context.client,
+                static_cast<double>(cfg.get_operator_params().scan_task_batch_size),
+                static_cast<double>(std::max(1, cfg.get_gpu_pipeline_executor_config().num_threads)));
+              features.need_fast = w.peak;
+              features.need_min  = w.work;
             }
             features.valid = true;
             duckdb::SiriusContext::set_pending_plan_features(features);

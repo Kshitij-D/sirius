@@ -1044,6 +1044,10 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     load_footprints(v);
     preadmit_ = admit_gpu_bytes_ > 0;
   }
+  if (auto const* v = std::getenv("SIRIUS_ADMIT_STRUCTURAL")) {
+    admit_structural_scale_ = std::stod(v);
+    preadmit_               = admit_gpu_bytes_ > 0 && admit_structural_scale_ > 0;
+  }
   if (auto const* v = std::getenv("SIRIUS_ADMIT_PLAN_COEFS")) {
     std::string s(v);
     std::size_t pos = 0;
@@ -2218,6 +2222,9 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
       }
       projected = p > 0 ? static_cast<std::size_t>(p) : 0;
     }
+    if (features.valid && admit_structural_scale_ > 0) {
+      projected = static_cast<std::size_t>(admit_structural_scale_ * features.need_fast);
+    }
   }
 
   {
@@ -2300,12 +2307,13 @@ void SiriusContext::release_query_lifecycle_slot() noexcept
       if (std::FILE* f = std::fopen(footprint_log_path_.c_str(), "a")) {
         auto const& ft = t_window.features.f;
         std::fprintf(f,
-                     "%016llx\t%zu\t%zu\t%d\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%s\n",
+                     "%016llx\t%zu\t%zu\t%d\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%s\n",
                      static_cast<unsigned long long>(t_window.fingerprint),
                      peak_up,
                      t_window.projected,
                      t_window.features.valid ? 1 : 0,
                      ft[0], ft[1], ft[2], ft[3], ft[4], ft[5], ft[6], ft[7],
+                     t_window.features.need_fast, t_window.features.need_min,
                      t_window.query_head.c_str());
         std::fclose(f);
       }

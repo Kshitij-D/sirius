@@ -54,6 +54,7 @@ def main():
     p.add_argument("--admit-footprints", default=None, help="measured footprint TSV -> pre-admission")
     p.add_argument("--admit-plan-coefs", default=None, help="c0,c1..c6 -> query-aware plan pre-admission")
     p.add_argument("--admit-default-gb", type=float, default=0)
+    p.add_argument("--admit-structural", type=float, default=0, help="scale * plan need_fast -> structural pre-admission")
     p.add_argument("--gpu-frac", type=float, default=0.90, help="Sirius GPU usage_limit_fraction")
     a = p.parse_args()
     max_conc = a.max_conc or a.clients
@@ -75,6 +76,7 @@ def main():
     if a.footprint_log: os.environ["SIRIUS_FOOTPRINT_LOG"] = os.path.abspath(a.out + ".fp.tsv")
     if a.admit_footprints: os.environ["SIRIUS_ADMIT_FOOTPRINTS"] = os.path.abspath(a.admit_footprints)
     if a.admit_plan_coefs: os.environ["SIRIUS_ADMIT_PLAN_COEFS"] = a.admit_plan_coefs
+    if a.admit_structural: os.environ["SIRIUS_ADMIT_STRUCTURAL"] = str(a.admit_structural)
     if a.admit_default_gb: os.environ["SIRIUS_ADMIT_DEFAULT_BYTES"] = str(int(a.admit_default_gb * (1 << 30)))
     os.environ["SIRIUS_PIN_TIER"] = a.pin if a.pin != "none" else "gpu"
 

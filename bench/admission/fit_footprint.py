@@ -21,7 +21,7 @@ def load(paths):
             r = line.rstrip("\n").split("\t")
             if len(r) < 11 or r[3] != "1":
                 continue
-            nf = len(r) - 5  # 6 (old logs) or 8 features
+            nf = min(8, len(r) - 5)  # 6 (old logs) or 8 features; later logs add need_fast/need_min
             f = np.zeros(8); f[:nf] = [float(x) for x in r[4:4 + nf]]
             if not f.any():
                 continue  # trivial queries (no scan) carry no signal
@@ -89,6 +89,7 @@ def main():
         "scan bytes only": [0],
         "scan + join build": [0, 2],
         "base capped + join build + agg": [7, 2, 4],
+        "capped scans + breakers": [1, 7, 2, 4, 5],
     }
     print("held-out test set (fit on train only):")
     coefs = {}
