@@ -34,6 +34,9 @@
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/planner.hpp>
+#include <mutex>
+#include <duckdb/planner/logical_operator.hpp>
+#include <duckdb/planner/operator/logical_get.hpp>
 
 namespace sirius::transparent {
 
@@ -120,6 +123,93 @@ PhysicalSiriusExecution::PhysicalSiriusExecution(
 {
 }
 
+namespace {
+
+// Bytes per row of an operator's output, cuDF-style: fixed-width types at their
+// physical size, strings as offsets plus an assumed average payload.
+double row_width(duckdb::vector<duckdb::LogicalType> const& types)
+{
+  double w = 0;
+  for (auto const& t : types) {
+    auto pt = t.InternalType();
+    if (pt == duckdb::PhysicalType::VARCHAR) {
+      w += 4 + 20;
+    } else if (duckdb::TypeIsConstantSize(pt)) {
+      w += static_cast<double>(duckdb::GetTypeIdSize(pt));
+    } else {
+      w += 16;
+    }
+  }
+  return w;
+}
+
+double card(duckdb::LogicalOperator& op, duckdb::ClientContext& ctx)
+{
+  return static_cast<double>(op.has_estimated_cardinality ? op.estimated_cardinality
+                                                          : op.EstimateCardinality(ctx));
+}
+
+// Walk the optimized logical plan and accumulate footprint features (see
+// plan_footprint_features). Pure estimate: no execution, no GPU state.
+void accumulate_features(duckdb::LogicalOperator& op,
+                         duckdb::ClientContext& ctx,
+                         duckdb::plan_footprint_features& out)
+{
+  using T                       = duckdb::LogicalOperatorType;
+  constexpr double k_batch_bytes = 2.0 * (1ULL << 30);
+  switch (op.type) {
+    case T::LOGICAL_GET: {
+      double b = card(op, ctx) * row_width(op.types);
+      out.f[0] += b;
+      out.f[1] += std::min(b, k_batch_bytes);
+      // Unfiltered bytes of every column the scan reads (filter columns
+      // included): scans materialize whole batches before filtering.
+      auto& get = op.Cast<duckdb::LogicalGet>();
+      if (get.function.cardinality) {
+        auto stats = get.function.cardinality(ctx, get.bind_data.get());
+        if (stats && stats->has_estimated_cardinality) {
+          duckdb::vector<duckdb::LogicalType> read_types;
+          for (auto const& col : get.GetColumnIds()) {
+            if (col.IsVirtualColumn()) { continue; }
+            auto idx = col.GetPrimaryIndex();
+            if (idx < get.returned_types.size()) { read_types.push_back(get.returned_types[idx]); }
+          }
+          double base = static_cast<double>(stats->estimated_cardinality) * row_width(read_types);
+          out.f[6] += base;
+          out.f[7] += std::min(base, k_batch_bytes);
+        }
+      }
+      break;
+    }
+    case T::LOGICAL_COMPARISON_JOIN:
+    case T::LOGICAL_DELIM_JOIN:
+    case T::LOGICAL_ANY_JOIN:
+    case T::LOGICAL_ASOF_JOIN:
+    case T::LOGICAL_CROSS_PRODUCT:
+      if (op.children.size() == 2) {
+        auto& build = *op.children[1];
+        out.f[2] += card(build, ctx) * row_width(build.types);
+      }
+      out.f[3] += card(op, ctx) * row_width(op.types);
+      break;
+    case T::LOGICAL_AGGREGATE_AND_GROUP_BY:
+    case T::LOGICAL_WINDOW: out.f[4] += card(op, ctx) * row_width(op.types); break;
+    case T::LOGICAL_ORDER_BY:
+    case T::LOGICAL_TOP_N:
+      if (!op.children.empty()) {
+        auto& in = *op.children[0];
+        out.f[5] += card(in, ctx) * row_width(in.types);
+      }
+      break;
+    default: break;
+  }
+  for (auto& child : op.children) {
+    accumulate_features(*child, ctx, out);
+  }
+}
+
+}  // namespace
+
 // ---------------------------------------------------------------------------
 // Source interface
 // ---------------------------------------------------------------------------
@@ -168,6 +258,24 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
     std::optional<duckdb::SiriusContext::StandaloneQueryScope> window;
     try {
       if (state.sirius_context) {
+        if (logical_plan_) {
+          // Query-aware pre-admission: estimate this query's GPU footprint from
+          // the optimized plan before it competes for an execution window.
+          try {
+            duckdb::plan_footprint_features features;
+            {
+              // The template may be shared by concurrent EXECUTEs of one prepared
+              // statement; resolving types mutates it, so serialize.
+              static std::mutex resolve_mutex;
+              std::lock_guard<std::mutex> lock(resolve_mutex);
+              logical_plan_->ResolveOperatorTypes();
+              accumulate_features(*logical_plan_, context.client, features);
+            }
+            features.valid = true;
+            duckdb::SiriusContext::set_pending_plan_features(features);
+          } catch (...) {
+          }
+        }
         window.emplace(*state.sirius_context, context.client, "transparent_execution");
       }
       if (!logical_plan_ && query_sql_.empty()) {

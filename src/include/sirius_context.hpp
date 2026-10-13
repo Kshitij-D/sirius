@@ -236,6 +236,18 @@ class SiriusSharedCleanupStepFailure : public std::runtime_error {
 };
 
 /// \brief Manages the lifetime of the sirius_context within a DuckDB ClientContext.
+/// Plan-derived GPU footprint features (bytes, from DuckDB's optimized logical
+/// plan and its cardinality estimates), computed before admission. The
+/// pre-admission projection is a calibrated linear combination of these.
+struct plan_footprint_features {
+  static constexpr int k_count = 8;
+  // scan output, scan output capped per scan at one batch, join build sides,
+  // join outputs, aggregate state, sort/top-n inputs, unfiltered base-table
+  // bytes of the scanned columns, and the same capped per scan at one batch
+  double f[k_count]{};
+  bool valid{false};
+};
+
 class SiriusContext : public ClientContextState {
  public:
   struct transparent_execution_stats {
@@ -933,6 +945,9 @@ class SiriusContext : public ClientContextState {
   //                           max(allocated, idle level + live projections)
   //                           + this query's projection <= ADMIT_GPU_BYTES.
   //   SIRIUS_ADMIT_DEFAULT_BYTES projection for queries without a footprint.
+  //   SIRIUS_ADMIT_PLAN_COEFS "c0,c1..c8": query-aware projection from plan
+  //                           features (c0 + sum ci*fi); takes precedence over
+  //                           measured footprints when the plan is available.
   std::size_t admit_gpu_bytes_{0};
   int admit_gap_ms_{0};
   std::chrono::steady_clock::time_point last_admit_{};
@@ -945,7 +960,15 @@ class SiriusContext : public ClientContextState {
   std::uint64_t admissions_{0};          // guarded by query_lifecycle_mutex_
   std::string footprint_log_path_;
   std::mutex footprint_log_mutex_;
+  std::vector<double> plan_coefs_;
   void load_footprints(std::string const& path);
+
+ public:
+  /// Hand the next admission on this thread its plan features (transparent
+  /// execution computes them from the logical plan before opening the window).
+  static void set_pending_plan_features(plan_footprint_features const& f) noexcept;
+
+ private:
   void reset_gpu_peak();
   std::size_t gpu_peak_bytes() const;
   std::atomic<bool> memlog_stop_{false};

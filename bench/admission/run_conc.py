@@ -18,7 +18,7 @@ EXT = os.path.join(REPO, "build/release/extension/sirius/sirius.duckdb_extension
 CONFIG = """sirius:
     topology: {{ num_gpus: 1 }}
     memory:
-        gpu: {{ usage_limit_fraction: 0.90, reservation_limit_fraction: 1.0, downgrade_trigger_fraction: 0.9, downgrade_stop_fraction: 0.85 }}
+        gpu: {{ usage_limit_fraction: {gpu_frac}, reservation_limit_fraction: 1.0, downgrade_trigger_fraction: 0.9, downgrade_stop_fraction: 0.85 }}
         host: {{ capacity_bytes: {host_bytes}, initial_number_pools: {host_pools}, pool_size: 8, block_size: 67108864 }}
         disk: {{ disk_id: 0, capacity_bytes: 500000000000, downgrade_root_dirs: "{disk_dir}" }}
     executor:
@@ -50,6 +50,11 @@ def main():
     p.add_argument("--memlog", action="store_true", help="sample GPU/host tier usage to <out>.mem.csv")
     p.add_argument("--admit-gb", type=float, default=0, help="memory-gated admission threshold (GPU allocated GB)")
     p.add_argument("--admit-gap-ms", type=int, default=0)
+    p.add_argument("--footprint-log", action="store_true", help="per-query solo footprints + plan features to <out>.fp.tsv")
+    p.add_argument("--admit-footprints", default=None, help="measured footprint TSV -> pre-admission")
+    p.add_argument("--admit-plan-coefs", default=None, help="c0,c1..c6 -> query-aware plan pre-admission")
+    p.add_argument("--admit-default-gb", type=float, default=0)
+    p.add_argument("--gpu-frac", type=float, default=0.90, help="Sirius GPU usage_limit_fraction")
     a = p.parse_args()
     max_conc = a.max_conc or a.clients
     qset = set()
@@ -62,11 +67,15 @@ def main():
     os.makedirs(disk_dir, exist_ok=True)
     open(cfg, "w").write(CONFIG.format(host_bytes=a.host_gb << 30, host_pools=(a.host_gb << 30) // (8 * 67108864),
                                        disk_dir=disk_dir, scan_threads=a.scan_threads, max_conc=max_conc,
-                                       pipe_threads=a.pipe_threads, scan_batch=a.scan_batch))
+                                       pipe_threads=a.pipe_threads, scan_batch=a.scan_batch, gpu_frac=a.gpu_frac))
     os.environ["SIRIUS_CONFIG_FILE"] = cfg
     if a.memlog: os.environ["SIRIUS_MEMLOG"] = os.path.abspath(a.out + ".mem.csv")
     if a.admit_gb: os.environ["SIRIUS_ADMIT_GPU_BYTES"] = str(int(a.admit_gb * (1 << 30)))
     if a.admit_gap_ms: os.environ["SIRIUS_ADMIT_GAP_MS"] = str(a.admit_gap_ms)
+    if a.footprint_log: os.environ["SIRIUS_FOOTPRINT_LOG"] = os.path.abspath(a.out + ".fp.tsv")
+    if a.admit_footprints: os.environ["SIRIUS_ADMIT_FOOTPRINTS"] = os.path.abspath(a.admit_footprints)
+    if a.admit_plan_coefs: os.environ["SIRIUS_ADMIT_PLAN_COEFS"] = a.admit_plan_coefs
+    if a.admit_default_gb: os.environ["SIRIUS_ADMIT_DEFAULT_BYTES"] = str(int(a.admit_default_gb * (1 << 30)))
     os.environ["SIRIUS_PIN_TIER"] = a.pin if a.pin != "none" else "gpu"
 
     R = dict(args=vars(a), max_conc=max_conc, marks={})

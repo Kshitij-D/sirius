@@ -1044,6 +1044,20 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     load_footprints(v);
     preadmit_ = admit_gpu_bytes_ > 0;
   }
+  if (auto const* v = std::getenv("SIRIUS_ADMIT_PLAN_COEFS")) {
+    std::string s(v);
+    std::size_t pos = 0;
+    while (pos <= s.size()) {
+      auto comma = s.find(',', pos);
+      plan_coefs_.push_back(std::stod(s.substr(pos, comma - pos)));
+      if (comma == std::string::npos) { break; }
+      pos = comma + 1;
+    }
+    if (plan_coefs_.size() != plan_footprint_features::k_count + 1) {
+      throw std::runtime_error("SIRIUS_ADMIT_PLAN_COEFS needs 9 comma-separated values");
+    }
+    preadmit_ = admit_gpu_bytes_ > 0;
+  }
   // Validate the cached topology before any downstream construction so a stub
   // topology fails loudly rather than producing zero-GPU executors silently.
   // get_hw_topology() is the only authorised source of physical GPU/NUMA discovery — never call
@@ -2146,8 +2160,10 @@ struct window_info {
   std::size_t start_alloc{0};
   bool started_alone{false};
   std::string query_head;
+  plan_footprint_features features;
 };
 thread_local window_info t_window;
+thread_local plan_footprint_features t_pending_features;
 
 // FNV-1a over the query text: stable across processes, unlike std::hash.
 std::uint64_t query_fingerprint(std::string const& q)
@@ -2189,10 +2205,19 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
     } catch (...) {
     }
   }
+  auto const features = t_pending_features;
+  t_pending_features  = plan_footprint_features{};
   std::size_t projected = admit_default_bytes_;
   if (preadmit_) {
     auto it = footprints_.find(fingerprint);
     if (it != footprints_.end()) { projected = it->second; }
+    if (features.valid && plan_coefs_.size() == plan_footprint_features::k_count + 1) {
+      double p = plan_coefs_[0];
+      for (int i = 0; i < plan_footprint_features::k_count; ++i) {
+        p += plan_coefs_[i + 1] * features.f[i];
+      }
+      projected = p > 0 ? static_cast<std::size_t>(p) : 0;
+    }
   }
 
   {
@@ -2203,7 +2228,7 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
     } else {
       // Memory-gated admission: GPU allocations are not signalled through the
       // cv, so poll. The first window is always admitted (no deadlock).
-      auto can_admit = [this] {
+      auto can_admit = [this, projected] {
         if (query_lifecycle_active_ >= query_lifecycle_slots_) { return false; }
         if (query_lifecycle_active_ == 0) { return true; }
         if (std::chrono::steady_clock::now() - last_admit_ <
@@ -2229,7 +2254,7 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
       if (!footprint_log_path_.empty()) { reset_gpu_peak(); }
     }
     t_window = window_info{fingerprint, projected, ++admissions_, gpu_allocated_bytes(),
-                           query_lifecycle_active_ == 0, std::move(query_head)};
+                           query_lifecycle_active_ == 0, std::move(query_head), features};
     live_projected_bytes_ += preadmit_ ? projected : 0;
     ++query_lifecycle_active_;
     if (query_lifecycle_active_ > query_lifecycle_peak_.load(std::memory_order_relaxed)) {
@@ -2273,10 +2298,14 @@ void SiriusContext::release_query_lifecycle_slot() noexcept
     try {
       std::lock_guard<std::mutex> lock(footprint_log_mutex_);
       if (std::FILE* f = std::fopen(footprint_log_path_.c_str(), "a")) {
+        auto const& ft = t_window.features.f;
         std::fprintf(f,
-                     "%016llx\t%zu\t%s\n",
+                     "%016llx\t%zu\t%zu\t%d\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%s\n",
                      static_cast<unsigned long long>(t_window.fingerprint),
                      peak_up,
+                     t_window.projected,
+                     t_window.features.valid ? 1 : 0,
+                     ft[0], ft[1], ft[2], ft[3], ft[4], ft[5], ft[6], ft[7],
                      t_window.query_head.c_str());
         std::fclose(f);
       }
@@ -2297,6 +2326,11 @@ std::size_t SiriusContext::gpu_allocated_bytes() const
     }
   }
   return total;
+}
+
+void SiriusContext::set_pending_plan_features(plan_footprint_features const& f) noexcept
+{
+  t_pending_features = f;
 }
 
 void SiriusContext::load_footprints(std::string const& path)
