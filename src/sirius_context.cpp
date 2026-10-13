@@ -920,7 +920,7 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
   }
 
   ctx_.acquire_query_lifecycle_slot(&context);
-  note_window_query(sirius::value_of(window_id_));
+  ctx_.note_window_query(sirius::value_of(window_id_));
   log_window_event("begin", "-");
   try {
     // SNAPSHOT-AT-WINDOW-BEGIN (E1/E2): this query sees the SET-mutable config
@@ -1047,6 +1047,12 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     preadmit_ = admit_gpu_bytes_ > 0;
   }
   if (auto const* v = std::getenv("SIRIUS_QUERYLOG")) { querylog_path_ = v; }
+  if (auto const* v = std::getenv("SIRIUS_ADMIT_RUNTIME")) { admit_runtime_ = std::string(v) == "1"; }
+  if (auto const* v = std::getenv("SIRIUS_ADMIT_AGING_MS")) { admit_aging_ms_ = std::stoi(v); }
+  if (auto const* v = std::getenv("SIRIUS_ADMIT_DEVICE_MARGIN_GB")) {
+    admit_device_aware_  = true;
+    admit_device_margin_ = static_cast<std::size_t>(std::stod(v) * (1ULL << 30));
+  }
   if (auto const* v = std::getenv("SIRIUS_ADMIT_LEARNED")) {
     admit_learned_scale_ = std::stod(v);
     preadmit_            = admit_gpu_bytes_ > 0 && admit_learned_scale_ > 0;
@@ -2257,7 +2263,8 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
     } else {
       // Memory-gated admission: GPU allocations are not signalled through the
       // cv, so poll. The first window is always admitted (no deadlock).
-      auto can_admit = [this, projected] {
+      auto const my_waiter = ++waiter_seq_;
+      auto can_admit       = [this, projected, my_waiter] {
         if (query_lifecycle_active_ >= query_lifecycle_slots_) { return false; }
         if (query_lifecycle_active_ == 0) { return true; }
         if (std::chrono::steady_clock::now() - last_admit_ <
@@ -2267,13 +2274,22 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
         if (!preadmit_) { return gpu_allocated_bytes() <= admit_gpu_bytes_; }
         // Pre-admission: charge live windows their projections (they may not
         // have allocated yet), but never assume less than what is allocated.
-        auto committed = std::max(gpu_allocated_bytes(), idle_alloc_bytes_ + live_projected_bytes_);
-        return committed + projected <= admit_gpu_bytes_;
+        auto committed = committed_bytes() + projected;
+        // Aging: the oldest waiter past the threshold keeps room for itself.
+        if (admit_aging_ms_ > 0 && !waiters_.empty()) {
+          auto const& oldest = waiters_.begin()->second;
+          bool const starving =
+            std::chrono::steady_clock::now() - oldest.since > std::chrono::milliseconds(admit_aging_ms_);
+          if (starving && waiters_.begin()->first != my_waiter) { committed += oldest.projected; }
+        }
+        return committed <= admit_budget();
       };
       ++query_lifecycle_waiting_;
+      waiters_[my_waiter] = waiter{wait_start, projected};
       while (!can_admit()) {
         query_lifecycle_cv_.wait_for(lock, std::chrono::milliseconds(2));
       }
+      waiters_.erase(my_waiter);
       --query_lifecycle_waiting_;
       last_admit_ = std::chrono::steady_clock::now();
     }
@@ -2289,6 +2305,7 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
     t_window.wait_start     = wait_start;
     t_window.admitted       = std::chrono::steady_clock::now();
     live_projected_bytes_ += preadmit_ ? projected : 0;
+    live_windows_[t_window.admission_seq] = live_window{preadmit_ ? projected : 0, 0};
     ++query_lifecycle_active_;
     if (query_lifecycle_active_ > query_lifecycle_peak_.load(std::memory_order_relaxed)) {
       query_lifecycle_peak_.store(query_lifecycle_active_, std::memory_order_relaxed);
@@ -2318,6 +2335,7 @@ void SiriusContext::release_query_lifecycle_slot() noexcept
   {
     std::lock_guard<std::mutex> lock(query_lifecycle_mutex_);
     if (preadmit_) { live_projected_bytes_ -= std::min(live_projected_bytes_, t_window.projected); }
+    live_windows_.erase(t_window.admission_seq);
     // Solo window: started with nothing live and nobody was admitted since.
     solo = t_window.started_alone && admissions_ == t_window.admission_seq;
     if (t_window.query_id != 0) {
@@ -2388,6 +2406,32 @@ void SiriusContext::release_query_lifecycle_slot() noexcept
 void SiriusContext::note_window_query(std::uint32_t query_id) noexcept
 {
   t_window.query_id = query_id;
+  std::lock_guard<std::mutex> lock(query_lifecycle_mutex_);
+  auto it = live_windows_.find(t_window.admission_seq);
+  if (it != live_windows_.end()) { it->second.query_id = query_id; }
+}
+
+std::size_t SiriusContext::admit_budget() const
+{
+  if (!admit_device_aware_) { return admit_gpu_bytes_; }
+  std::size_t free_b = 0, total_b = 0;
+  if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) { return admit_gpu_bytes_; }
+  auto const device_budget = gpu_allocated_bytes() + free_b;
+  auto const cap = device_budget > admit_device_margin_ ? device_budget - admit_device_margin_ : 0;
+  return std::min(admit_gpu_bytes_, cap);
+}
+
+std::size_t SiriusContext::committed_bytes() const
+{
+  auto const allocated = gpu_allocated_bytes();
+  if (!admit_runtime_) { return std::max(allocated, idle_alloc_bytes_ + live_projected_bytes_); }
+  // Online correction: a live window costs at least what the engine already holds for it.
+  std::size_t sum = idle_alloc_bytes_;
+  auto& ledger    = sirius::memory::query_memory_ledger::instance();
+  for (auto const& [seq, w] : live_windows_) {
+    sum += std::max(w.projected, w.query_id != 0 ? ledger.live(w.query_id) : 0);
+  }
+  return std::max(allocated, sum);
 }
 
 std::size_t SiriusContext::gpu_allocated_bytes() const

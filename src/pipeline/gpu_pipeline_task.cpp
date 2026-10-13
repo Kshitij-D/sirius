@@ -627,6 +627,11 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   // 3. Execute cudf operators on the pipeline
   _allocator       = allocator;
   auto input_basis = local_state.get_reservation_size_info()->input_basis;
+  // Ledger: a non-scan input is a previously published intermediate; this task consumes it.
+  if (local_state._input_data &&
+      local_state._input_data->get_type() != op::operator_data_type::GPU_SCAN) {
+    sirius::memory::query_memory_ledger::instance().sub_held(ledger_query, input_basis);
+  }
   std::unique_ptr<op::operator_data> output_data = compute_task(stream);
 
   // Record memory metrics for future reservation estimates
@@ -649,6 +654,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     }
     auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
     global.get_memory_history().record({input_basis, peak_bytes, output_bytes});
+    sirius::memory::query_memory_ledger::instance().add_held(ledger_query, output_bytes);
     // Experimental (env-gated): per-task estimate vs actual, for the admission study.
     static std::string const tasklog_path = [] {
       auto const* v = std::getenv("SIRIUS_TASKLOG");

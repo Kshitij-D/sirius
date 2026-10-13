@@ -954,6 +954,14 @@ class SiriusContext : public ClientContextState {
   //                           peak of the template's last runs (Sirius's own
   //                           task reservations, summed per query); unseen
   //                           templates fall back to the other sources.
+  //   SIRIUS_ADMIT_RUNTIME 1  charge each live window max(projection, what the
+  //                           engine ledger says it holds now) instead of its
+  //                           projection alone (online correction).
+  //   SIRIUS_ADMIT_DEVICE_MARGIN_GB  also cap the budget at what the device
+  //                           really has (Sirius allocations + cudaMemGetInfo
+  //                           free - margin), so co-tenants shrink it online.
+  //   SIRIUS_ADMIT_AGING_MS   a waiter older than this reserves room: younger
+  //                           windows are admitted only if it would still fit.
   //   SIRIUS_QUERYLOG         TSV: per window fingerprint, wait, run time,
   //                           projection, engine peak, live peers at admission.
   //   SIRIUS_ADMIT_STRUCTURAL <scale>: projection = scale * need_fast from the
@@ -979,10 +987,27 @@ class SiriusContext : public ClientContextState {
   // fingerprint -> last few engine-ledger peaks; guarded by query_lifecycle_mutex_
   std::unordered_map<std::uint64_t, std::vector<std::size_t>> learned_peaks_;
   std::string querylog_path_;  // SIRIUS_QUERYLOG
+  bool admit_runtime_{false};
+  std::size_t admit_device_margin_{0};
+  bool admit_device_aware_{false};
+  std::size_t admit_budget() const;  // caller holds query_lifecycle_mutex_
+  int admit_aging_ms_{0};
+  struct live_window {
+    std::size_t projected{0};
+    std::uint32_t query_id{0};
+  };
+  std::unordered_map<std::uint64_t, live_window> live_windows_;  // by admission seq
+  struct waiter {
+    std::chrono::steady_clock::time_point since;
+    std::size_t projected{0};
+  };
+  std::map<std::uint64_t, waiter> waiters_;  // by waiter seq (oldest first)
+  std::uint64_t waiter_seq_{0};
+  std::size_t committed_bytes() const;  // caller holds query_lifecycle_mutex_
 
  public:
   /// Tell the admission bookkeeping which Sirius query id the current window runs.
-  static void note_window_query(std::uint32_t query_id) noexcept;
+  void note_window_query(std::uint32_t query_id) noexcept;
 
  private:
   void load_footprints(std::string const& path);

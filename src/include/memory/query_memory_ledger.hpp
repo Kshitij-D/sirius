@@ -47,7 +47,7 @@ class query_memory_ledger {
     std::lock_guard<std::mutex> lock(_mutex);
     auto& e = _entries[query];
     e.live += bytes;
-    e.peak = std::max(e.peak, e.live);
+    e.peak = std::max(e.peak, e.live + e.held);
   }
 
   void sub(std::uint32_t query, std::size_t bytes)
@@ -58,11 +58,29 @@ class query_memory_ledger {
     it->second.live -= std::min(it->second.live, bytes);
   }
 
+  /// Intermediate results a query published (pipeline outputs) and not yet consumed.
+  void add_held(std::uint32_t query, std::size_t bytes)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    auto& e = _entries[query];
+    e.held += bytes;
+    e.peak = std::max(e.peak, e.live + e.held);
+  }
+
+  void sub_held(std::uint32_t query, std::size_t bytes)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    auto it = _entries.find(query);
+    if (it == _entries.end()) { return; }
+    it->second.held -= std::min(it->second.held, bytes);
+  }
+
+  /// Bytes the engine currently commits to a query: live task reservations plus held results.
   [[nodiscard]] std::size_t live(std::uint32_t query) const
   {
     std::lock_guard<std::mutex> lock(_mutex);
     auto it = _entries.find(query);
-    return it == _entries.end() ? 0 : it->second.live;
+    return it == _entries.end() ? 0 : it->second.live + it->second.held;
   }
 
   /// Peak reserved bytes of a finished query; forgets the query.
@@ -79,6 +97,7 @@ class query_memory_ledger {
  private:
   struct entry {
     std::size_t live{0};
+    std::size_t held{0};
     std::size_t peak{0};
   };
   mutable std::mutex _mutex;

@@ -56,14 +56,33 @@ def main():
     p.add_argument("--admit-default-gb", type=float, default=0)
     p.add_argument("--admit-structural", type=float, default=0, help="scale * plan need_fast -> structural pre-admission")
     p.add_argument("--admit-learned", type=float, default=0, help="scale * engine-learned per-template peak")
+    p.add_argument("--admit-runtime", action="store_true", help="online correction from engine ledger")
+    p.add_argument("--admit-aging-ms", type=int, default=0, help="starvation bound for waiting queries")
+    p.add_argument("--admit-device-margin-gb", type=float, default=None, help="device-aware budget (margin GB)")
+    p.add_argument("--groups", default=None, help='mixed workload: "1,9,13:4;6,14,19:12" = query subset:clients ...')
+    p.add_argument("--admit-gb-auto", type=float, default=None,
+                   help="for admission policies: budget = frac * device memory - 2 GB")
+    p.add_argument("--hog", default=None, help="co-tenant: delay_s,gib,hold_s after throughput phase starts")
     p.add_argument("--querylog", action="store_true", help="per-query wait/run/projection/engine peak -> <out>.q.tsv")
     p.add_argument("--tasklog", action="store_true", help="per-task Sirius estimate vs actual to <out>.task.tsv")
     p.add_argument("--gpu-frac", type=float, default=0.90, help="Sirius GPU usage_limit_fraction")
     a = p.parse_args()
+    def parse(spec):
+        out = set()
+        for part in spec.split(","):
+            lo, _, hi = part.partition("-"); out.update(range(int(lo), int(hi or lo) + 1))
+        return out
+    client_sets = None
+    if a.groups:
+        client_sets = []
+        for g in a.groups.split(";"):
+            spec, _, n = g.rpartition(":")
+            client_sets += [parse(spec)] * int(n)
+        a.clients = len(client_sets)
+        qset = set().union(*client_sets)
+    else:
+        qset = parse(a.queries)
     max_conc = a.max_conc or a.clients
-    qset = set()
-    for part in a.queries.split(","):
-        lo, _, hi = part.partition("-"); qset.update(range(int(lo), int(hi or lo) + 1))
 
     cfg = os.path.abspath(a.out + ".yaml")
     os.makedirs(os.path.dirname(cfg), exist_ok=True)
@@ -74,12 +93,19 @@ def main():
                                        pipe_threads=a.pipe_threads, scan_batch=a.scan_batch, gpu_frac=a.gpu_frac))
     os.environ["SIRIUS_CONFIG_FILE"] = cfg
     if a.memlog: os.environ["SIRIUS_MEMLOG"] = os.path.abspath(a.out + ".mem.csv")
+    if a.admit_gb_auto and (a.admit_learned or a.admit_footprints or a.admit_plan_coefs or a.admit_structural):
+        import subprocess
+        tot_mib = int(subprocess.check_output(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"]).split()[0])
+        a.admit_gb = a.admit_gb_auto * tot_mib / 1024 - 2
     if a.admit_gb: os.environ["SIRIUS_ADMIT_GPU_BYTES"] = str(int(a.admit_gb * (1 << 30)))
     if a.admit_gap_ms: os.environ["SIRIUS_ADMIT_GAP_MS"] = str(a.admit_gap_ms)
     if a.footprint_log: os.environ["SIRIUS_FOOTPRINT_LOG"] = os.path.abspath(a.out + ".fp.tsv")
     if a.admit_footprints: os.environ["SIRIUS_ADMIT_FOOTPRINTS"] = os.path.abspath(a.admit_footprints)
     if a.admit_plan_coefs: os.environ["SIRIUS_ADMIT_PLAN_COEFS"] = a.admit_plan_coefs
     if a.admit_learned: os.environ["SIRIUS_ADMIT_LEARNED"] = str(a.admit_learned)
+    if a.admit_runtime: os.environ["SIRIUS_ADMIT_RUNTIME"] = "1"
+    if a.admit_aging_ms: os.environ["SIRIUS_ADMIT_AGING_MS"] = str(a.admit_aging_ms)
+    if a.admit_device_margin_gb is not None: os.environ["SIRIUS_ADMIT_DEVICE_MARGIN_GB"] = str(a.admit_device_margin_gb)
     if a.querylog: os.environ["SIRIUS_QUERYLOG"] = os.path.abspath(a.out + ".q.tsv")
     if a.tasklog: os.environ["SIRIUS_TASKLOG"] = os.path.abspath(a.out + ".task.tsv")
     if a.admit_structural: os.environ["SIRIUS_ADMIT_STRUCTURAL"] = str(a.admit_structural)
@@ -127,8 +153,9 @@ def main():
     def client(i):
         c = curs[i]; barrier.wait()
         for r in range(a.rounds):
+            mine = client_sets[i] if client_sets else qset
             for q in stream_order(1 + i + r * a.clients):
-                if q not in qset: continue
+                if q not in mine: continue
                 t0 = now()
                 try: c.execute(QUERIES[f"q{q}"]).fetchall()
                 except Exception as e: errors.append((i, q, repr(e)[:300]))
@@ -136,6 +163,12 @@ def main():
     th = [threading.Thread(target=client, args=(i,)) for i in range(a.clients)]
     for x in th: x.start()
     ru0 = resource.getrusage(resource.RUSAGE_SELF); barrier.wait(); t0 = now()
+    hog = None
+    if a.hog:
+        import subprocess
+        d, g, h = a.hog.split(",")
+        hog = subprocess.Popen([os.path.join(os.path.dirname(os.path.abspath(__file__)), "hog"), d, g, h],
+                               stdout=open(a.out + ".hog.txt", "w"), stderr=subprocess.STDOUT)
     R["marks"]["tp_start"] = t0
     LOGF = os.path.join(os.getcwd(), "log", time.strftime("sirius_%Y-%m-%d.log"))
     log_off = os.path.getsize(LOGF) if os.path.exists(LOGF) else 0
