@@ -228,6 +228,7 @@ SiriusContext::~SiriusContext() noexcept
   // registry.clear() and memory_manager_->shutdown(). Letting that escape a noexcept destructor is
   // std::terminate, and this runs mid-DB-destruction (~DBConfig fires ~SiriusContext), where a
   // clean-enough teardown plus a log line is far better than aborting the process.
+  stop_memlog();
   if (is_initialized_) {
     try {
       terminate();
@@ -1031,6 +1032,18 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // may hold runtime state at once. Default 1 = the historical single-flight
   // behavior. Set before any query can reach acquire_query_lifecycle_slot.
   query_lifecycle_slots_ = std::max(1, config_.get_scan_manager_config().max_concurrent_queries);
+  if (auto const* v = std::getenv("SIRIUS_ADMIT_GPU_BYTES")) {
+    admit_gpu_bytes_ = std::stoull(v);
+  }
+  if (auto const* v = std::getenv("SIRIUS_ADMIT_GAP_MS")) { admit_gap_ms_ = std::stoi(v); }
+  if (auto const* v = std::getenv("SIRIUS_ADMIT_DEFAULT_BYTES")) {
+    admit_default_bytes_ = std::stoull(v);
+  }
+  if (auto const* v = std::getenv("SIRIUS_FOOTPRINT_LOG")) { footprint_log_path_ = v; }
+  if (auto const* v = std::getenv("SIRIUS_ADMIT_FOOTPRINTS")) {
+    load_footprints(v);
+    preadmit_ = admit_gpu_bytes_ > 0;
+  }
   // Validate the cached topology before any downstream construction so a stub
   // topology fails loudly rather than producing zero-GPU executors silently.
   // get_hw_topology() is the only authorised source of physical GPU/NUMA discovery — never call
@@ -1053,6 +1066,16 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
     config_.get_memory_space_configs());
+  start_memlog_if_requested();
+  if (admit_gpu_bytes_ > 0) {
+    SIRIUS_LOG_INFO(
+      "SiriusContext: {} admission at {} GPU bytes, gap {} ms, {} footprints, default {}",
+      preadmit_ ? "pre-admission" : "reactive memory-gated",
+      admit_gpu_bytes_,
+      admit_gap_ms_,
+      footprints_.size(),
+      admit_default_bytes_);
+  }
 
   // Declare one telemetry device group per GPU so thread/queue telemetry can
   // nest under its device instead of piling up flat under the engine. The GPU
@@ -2113,6 +2136,29 @@ namespace {
 // identity the old thread-id hash approximated, without the hash-collision
 // caveat, and it stays correct with more than one slot.
 thread_local bool t_holds_query_lifecycle_slot = false;
+
+// Per-window bookkeeping for footprint measurement and pre-admission; scope-bound
+// to the holding thread like the slot itself.
+struct window_info {
+  std::uint64_t fingerprint{0};
+  std::size_t projected{0};
+  std::uint64_t admission_seq{0};
+  std::size_t start_alloc{0};
+  bool started_alone{false};
+  std::string query_head;
+};
+thread_local window_info t_window;
+
+// FNV-1a over the query text: stable across processes, unlike std::hash.
+std::uint64_t query_fingerprint(std::string const& q)
+{
+  std::uint64_t h = 1469598103934665603ULL;
+  for (unsigned char c : q) {
+    h ^= c;
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
 }  // namespace
 
 void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
@@ -2130,10 +2176,61 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
   if (runtime_unavailable_.load(std::memory_order_acquire)) { throw_runtime_unavailable(); }
   if (context && context->IsInterrupted()) { throw InterruptException(); }
 
+  std::uint64_t fingerprint = 0;
+  std::string query_head;
+  if (context != nullptr && (!footprint_log_path_.empty() || preadmit_)) {
+    try {
+      auto const& q = context->GetCurrentQuery();
+      fingerprint   = query_fingerprint(q);
+      query_head    = q.substr(0, 80);
+      for (auto& ch : query_head) {
+        if (ch == '\t' || ch == '\n' || ch == '\r') { ch = ' '; }
+      }
+    } catch (...) {
+    }
+  }
+  std::size_t projected = admit_default_bytes_;
+  if (preadmit_) {
+    auto it = footprints_.find(fingerprint);
+    if (it != footprints_.end()) { projected = it->second; }
+  }
+
   {
     std::unique_lock<std::mutex> lock(query_lifecycle_mutex_);
-    query_lifecycle_cv_.wait(lock,
-                             [this] { return query_lifecycle_active_ < query_lifecycle_slots_; });
+    if (admit_gpu_bytes_ == 0) {
+      query_lifecycle_cv_.wait(lock,
+                               [this] { return query_lifecycle_active_ < query_lifecycle_slots_; });
+    } else {
+      // Memory-gated admission: GPU allocations are not signalled through the
+      // cv, so poll. The first window is always admitted (no deadlock).
+      auto can_admit = [this] {
+        if (query_lifecycle_active_ >= query_lifecycle_slots_) { return false; }
+        if (query_lifecycle_active_ == 0) { return true; }
+        if (std::chrono::steady_clock::now() - last_admit_ <
+            std::chrono::milliseconds(admit_gap_ms_)) {
+          return false;
+        }
+        if (!preadmit_) { return gpu_allocated_bytes() <= admit_gpu_bytes_; }
+        // Pre-admission: charge live windows their projections (they may not
+        // have allocated yet), but never assume less than what is allocated.
+        auto committed = std::max(gpu_allocated_bytes(), idle_alloc_bytes_ + live_projected_bytes_);
+        return committed + projected <= admit_gpu_bytes_;
+      };
+      ++query_lifecycle_waiting_;
+      while (!can_admit()) {
+        query_lifecycle_cv_.wait_for(lock, std::chrono::milliseconds(2));
+      }
+      --query_lifecycle_waiting_;
+      last_admit_ = std::chrono::steady_clock::now();
+    }
+    if (query_lifecycle_active_ == 0) {
+      // Nothing live: what is allocated now is resident state (pinned tables).
+      idle_alloc_bytes_ = gpu_allocated_bytes();
+      if (!footprint_log_path_.empty()) { reset_gpu_peak(); }
+    }
+    t_window = window_info{fingerprint, projected, ++admissions_, gpu_allocated_bytes(),
+                           query_lifecycle_active_ == 0, std::move(query_head)};
+    live_projected_bytes_ += preadmit_ ? projected : 0;
     ++query_lifecycle_active_;
     if (query_lifecycle_active_ > query_lifecycle_peak_.load(std::memory_order_relaxed)) {
       query_lifecycle_peak_.store(query_lifecycle_active_, std::memory_order_relaxed);
@@ -2157,13 +2254,134 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
 
 void SiriusContext::release_query_lifecycle_slot() noexcept
 {
+  bool solo           = false;
+  std::size_t peak_up = 0;
   {
     std::lock_guard<std::mutex> lock(query_lifecycle_mutex_);
+    if (preadmit_) { live_projected_bytes_ -= std::min(live_projected_bytes_, t_window.projected); }
+    // Solo window: started with nothing live and nobody was admitted since.
+    solo = t_window.started_alone && admissions_ == t_window.admission_seq;
+    if (solo && !footprint_log_path_.empty()) {
+      auto peak = gpu_peak_bytes();
+      peak_up   = peak > t_window.start_alloc ? peak - t_window.start_alloc : 0;
+    }
     --query_lifecycle_active_;
     query_lifecycle_held_.store(query_lifecycle_active_ > 0, std::memory_order_release);
   }
   t_holds_query_lifecycle_slot = false;
+  if (solo && !footprint_log_path_.empty() && t_window.fingerprint != 0) {
+    try {
+      std::lock_guard<std::mutex> lock(footprint_log_mutex_);
+      if (std::FILE* f = std::fopen(footprint_log_path_.c_str(), "a")) {
+        std::fprintf(f,
+                     "%016llx\t%zu\t%s\n",
+                     static_cast<unsigned long long>(t_window.fingerprint),
+                     peak_up,
+                     t_window.query_head.c_str());
+        std::fclose(f);
+      }
+    } catch (...) {
+    }
+  }
+  t_window = window_info{};
   query_lifecycle_cv_.notify_one();
+}
+
+std::size_t SiriusContext::gpu_allocated_bytes() const
+{
+  std::size_t total = 0;
+  for (auto const* space : memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+    if (space == nullptr) { continue; }
+    if (auto const* mr = space->get_memory_resource_of<cucascade::memory::Tier::GPU>()) {
+      total += mr->get_total_allocated_bytes();
+    }
+  }
+  return total;
+}
+
+void SiriusContext::load_footprints(std::string const& path)
+{
+  std::FILE* f = std::fopen(path.c_str(), "r");
+  if (f == nullptr) { throw std::runtime_error("SIRIUS_ADMIT_FOOTPRINTS: cannot open " + path); }
+  char line[4096];
+  while (std::fgets(line, sizeof(line), f) != nullptr) {
+    unsigned long long fp = 0;
+    unsigned long long bytes = 0;
+    if (std::sscanf(line, "%llx\t%llu", &fp, &bytes) == 2) {
+      auto& slot = footprints_[fp];
+      slot       = std::max<std::size_t>(slot, bytes);
+    }
+  }
+  std::fclose(f);
+}
+
+void SiriusContext::reset_gpu_peak()
+{
+  for (auto const* space : memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+    if (space == nullptr) { continue; }
+    if (auto* mr = space->get_memory_resource_of<cucascade::memory::Tier::GPU>()) {
+      mr->reset_peak_total_allocated_bytes();
+    }
+  }
+}
+
+std::size_t SiriusContext::gpu_peak_bytes() const
+{
+  std::size_t total = 0;
+  for (auto const* space : memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+    if (space == nullptr) { continue; }
+    if (auto const* mr = space->get_memory_resource_of<cucascade::memory::Tier::GPU>()) {
+      total += mr->get_peak_total_allocated_bytes();
+    }
+  }
+  return total;
+}
+
+void SiriusContext::start_memlog_if_requested()
+{
+  auto const* path = std::getenv("SIRIUS_MEMLOG");
+  if (path == nullptr || *path == '\0') { return; }
+  memlog_thread_ = std::thread([this, file = std::string(path)] {
+    std::FILE* f = std::fopen(file.c_str(), "w");
+    if (f == nullptr) { return; }
+    std::fprintf(f, "t,gpu_alloc,gpu_reserved,gpu_avail,host_reserved,live,waiting\n");
+    using namespace std::chrono;
+    while (!memlog_stop_.load(std::memory_order_relaxed)) {
+      double t = duration<double>(system_clock::now().time_since_epoch()).count();
+      std::size_t gres = 0;
+      for (auto const* sp :
+           memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+        if (sp == nullptr) { continue; }
+        if (auto const* mr = sp->get_memory_resource_of<cucascade::memory::Tier::GPU>()) {
+          gres += mr->get_total_reserved_bytes();
+        }
+      }
+      int live = 0, waiting = 0;
+      {
+        std::lock_guard<std::mutex> lock(query_lifecycle_mutex_);
+        live    = query_lifecycle_active_;
+        waiting = query_lifecycle_waiting_;
+      }
+      std::fprintf(f,
+                   "%.4f,%zu,%zu,%zu,%zu,%d,%d\n",
+                   t,
+                   gpu_allocated_bytes(),
+                   gres,
+                   memory_manager_->get_available_memory_for_tier(cucascade::memory::Tier::GPU),
+                   memory_manager_->get_total_reserved_memory_for_tier(cucascade::memory::Tier::HOST),
+                   live,
+                   waiting);
+      std::fflush(f);
+      std::this_thread::sleep_for(milliseconds(10));
+    }
+    std::fclose(f);
+  });
+}
+
+void SiriusContext::stop_memlog() noexcept
+{
+  memlog_stop_.store(true);
+  if (memlog_thread_.joinable()) { memlog_thread_.join(); }
 }
 
 // ================= Free Functions ================= //

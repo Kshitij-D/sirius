@@ -39,6 +39,9 @@
 #include <duckdb/planner/logical_operator.hpp>
 
 #include <atomic>
+#include <chrono>
+#include <thread>
+#include <unordered_map>
 #include <condition_variable>
 #include <functional>
 #include <map>
@@ -912,6 +915,44 @@ class SiriusContext : public ClientContextState {
   /// Diagnostic only (concurrency bring-up asserts overlap actually happened);
   /// written under query_lifecycle_mutex_, read lock-free.
   std::atomic<int> query_lifecycle_peak_{0};
+  // Experimental, env-gated (off by default), for the admission-control study:
+  //   SIRIUS_ADMIT_GPU_BYTES  admit a new window only while GPU-tier allocated
+  //                           bytes are at or below this (the first window is
+  //                           always admitted).
+  //   SIRIUS_ADMIT_GAP_MS     with the byte gate on, at most one admission per
+  //                           gap while other windows are live (lets a newly
+  //                           admitted query's allocations show up first).
+  //   SIRIUS_MEMLOG           CSV path; a sampler writes GPU/host tier usage and
+  //                           live/waiting window counts every 10 ms.
+  //   SIRIUS_FOOTPRINT_LOG    TSV path; for every window that ran alone, append
+  //                           query fingerprint, peak GPU bytes above the start
+  //                           level, and the query text prefix.
+  //   SIRIUS_ADMIT_FOOTPRINTS TSV of fingerprint -> bytes (a FOOTPRINT_LOG; max
+  //                           per fingerprint is used). Switches the byte gate
+  //                           to pre-admission: admit iff
+  //                           max(allocated, idle level + live projections)
+  //                           + this query's projection <= ADMIT_GPU_BYTES.
+  //   SIRIUS_ADMIT_DEFAULT_BYTES projection for queries without a footprint.
+  std::size_t admit_gpu_bytes_{0};
+  int admit_gap_ms_{0};
+  std::chrono::steady_clock::time_point last_admit_{};
+  int query_lifecycle_waiting_{0};
+  bool preadmit_{false};
+  std::unordered_map<std::uint64_t, std::size_t> footprints_;
+  std::size_t admit_default_bytes_{0};
+  std::size_t live_projected_bytes_{0};  // guarded by query_lifecycle_mutex_
+  std::size_t idle_alloc_bytes_{0};      // GPU allocated with no live window
+  std::uint64_t admissions_{0};          // guarded by query_lifecycle_mutex_
+  std::string footprint_log_path_;
+  std::mutex footprint_log_mutex_;
+  void load_footprints(std::string const& path);
+  void reset_gpu_peak();
+  std::size_t gpu_peak_bytes() const;
+  std::atomic<bool> memlog_stop_{false};
+  std::thread memlog_thread_;
+  std::size_t gpu_allocated_bytes() const;
+  void start_memlog_if_requested();
+  void stop_memlog() noexcept;
   // Pin and unpin take this exclusively; updates hold it from validation
   // through QueryEnd so neither operation can pass the other between checks.
   std::shared_mutex pinned_table_update_mutex_;

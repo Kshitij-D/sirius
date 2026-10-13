@@ -1,0 +1,56 @@
+diff --git a/include/cucascade/memory/detail/reservation_aware_resource_adaptor_impl.hpp b/include/cucascade/memory/detail/reservation_aware_resource_adaptor_impl.hpp
+index df6c705..15b36d8 100644
+--- a/include/cucascade/memory/detail/reservation_aware_resource_adaptor_impl.hpp
++++ b/include/cucascade/memory/detail/reservation_aware_resource_adaptor_impl.hpp
+@@ -161,6 +161,7 @@ class reservation_aware_resource_adaptor_impl {
+   std::size_t get_total_allocated_bytes() const;
+   std::size_t get_peak_total_allocated_bytes() const;
+   void reset_peak_allocated_bytes(rmm::cuda_stream_view stream);
++  void reset_peak_total_allocated_bytes();
+   std::size_t get_total_reserved_bytes() const;
+   bool is_stream_tracked(rmm::cuda_stream_view stream) const;
+ 
+diff --git a/include/cucascade/memory/reservation_aware_resource_adaptor.hpp b/include/cucascade/memory/reservation_aware_resource_adaptor.hpp
+index 53f4b8c..883581a 100644
+--- a/include/cucascade/memory/reservation_aware_resource_adaptor.hpp
++++ b/include/cucascade/memory/reservation_aware_resource_adaptor.hpp
+@@ -159,6 +159,11 @@ class reservation_aware_resource_adaptor
+    */
+   void reset_peak_allocated_bytes(rmm::cuda_stream_view stream);
+ 
++  /**
++   * @brief Resets the peak total allocated bytes to the current total.
++   */
++  void reset_peak_total_allocated_bytes();
++
+   /**
+    * @brief Gets the total reserved bytes across all streams.
+    * @return The total reserved bytes
+diff --git a/src/memory/reservation_aware_resource_adaptor.cpp b/src/memory/reservation_aware_resource_adaptor.cpp
+index 2d58fea..2ede538 100644
+--- a/src/memory/reservation_aware_resource_adaptor.cpp
++++ b/src/memory/reservation_aware_resource_adaptor.cpp
+@@ -320,6 +320,11 @@ std::size_t impl_type::get_peak_total_allocated_bytes() const
+   return _peak_total_allocated_bytes.peak();
+ }
+ 
++void impl_type::reset_peak_total_allocated_bytes()
++{
++  _peak_total_allocated_bytes.reset(_total_allocated_bytes.load());
++}
++
+ void impl_type::reset_peak_allocated_bytes(rmm::cuda_stream_view stream)
+ {
+   auto* stats = _allocation_tracker->get_tracker_state(stream);
+@@ -656,6 +661,11 @@ std::size_t reservation_aware_resource_adaptor::get_peak_total_allocated_bytes()
+   return get().get_peak_total_allocated_bytes();
+ }
+ 
++void reservation_aware_resource_adaptor::reset_peak_total_allocated_bytes()
++{
++  get().reset_peak_total_allocated_bytes();
++}
++
+ void reservation_aware_resource_adaptor::reset_peak_allocated_bytes(rmm::cuda_stream_view stream)
+ {
+   get().reset_peak_allocated_bytes(stream);
