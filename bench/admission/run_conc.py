@@ -62,9 +62,12 @@ def main():
     p.add_argument("--groups", default=None, help='mixed workload: "1,9,13:4;6,14,19:12" = query subset:clients ...')
     p.add_argument("--admit-gb-auto", type=float, default=None,
                    help="for admission policies: budget = frac * device memory - 2 GB")
+    p.add_argument("--no-warm", action="store_true", help="cold: skip serial warm-up (no template seen before)")
+    p.add_argument("--serial-ref", default=None, help="JSON of a warm run whose serial latencies define speedup")
     p.add_argument("--hog", default=None, help="co-tenant: delay_s,gib,hold_s after throughput phase starts")
     p.add_argument("--querylog", action="store_true", help="per-query wait/run/projection/engine peak -> <out>.q.tsv")
     p.add_argument("--tasklog", action="store_true", help="per-task Sirius estimate vs actual to <out>.task.tsv")
+    p.add_argument("--admit-structural-field", default=None, choices=["min", "fast"])
     p.add_argument("--gpu-frac", type=float, default=0.90, help="Sirius GPU usage_limit_fraction")
     a = p.parse_args()
     def parse(spec):
@@ -108,6 +111,7 @@ def main():
     if a.admit_device_margin_gb is not None: os.environ["SIRIUS_ADMIT_DEVICE_MARGIN_GB"] = str(a.admit_device_margin_gb)
     if a.querylog: os.environ["SIRIUS_QUERYLOG"] = os.path.abspath(a.out + ".q.tsv")
     if a.tasklog: os.environ["SIRIUS_TASKLOG"] = os.path.abspath(a.out + ".task.tsv")
+    if a.admit_structural_field: os.environ["SIRIUS_ADMIT_STRUCTURAL_FIELD"] = a.admit_structural_field
     if a.admit_structural: os.environ["SIRIUS_ADMIT_STRUCTURAL"] = str(a.admit_structural)
     if a.admit_default_gb: os.environ["SIRIUS_ADMIT_DEFAULT_BYTES"] = str(int(a.admit_default_gb * (1 << 30)))
     os.environ["SIRIUS_PIN_TIER"] = a.pin if a.pin != "none" else "gpu"
@@ -129,11 +133,15 @@ def main():
     # warm-up / serial single-query latencies (JIT compile happens on the first pass)
     R["marks"]["warm_start"] = now()
     serial = {}
-    for rep in range(3):
+    for rep in range(0 if a.no_warm else 3):
         for q in sorted(qset):
             t = now(); con.execute(QUERIES[f"q{q}"]).fetchall(); dt = now() - t
             if rep > 0: serial.setdefault(q, []).append(dt)
-    R["serial_latency_s"] = {q: min(v) for q, v in serial.items()}
+    if a.serial_ref:
+        ref = json.load(open(a.serial_ref))["serial_latency_s"]
+        R["serial_latency_s"] = {int(q): v for q, v in ref.items() if int(q) in qset}
+    else:
+        R["serial_latency_s"] = {q: min(v) for q, v in serial.items()}
     R["serial_sum_s"] = sum(R["serial_latency_s"].values())
     # fixed per-query overhead: trivial GPU query
     lat = []

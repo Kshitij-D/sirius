@@ -1057,6 +1057,9 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     admit_learned_scale_ = std::stod(v);
     preadmit_            = admit_gpu_bytes_ > 0 && admit_learned_scale_ > 0;
   }
+  if (auto const* v = std::getenv("SIRIUS_ADMIT_STRUCTURAL_FIELD")) {
+    admit_structural_min_ = std::string(v) == "min";
+  }
   if (auto const* v = std::getenv("SIRIUS_ADMIT_STRUCTURAL")) {
     admit_structural_scale_ = std::stod(v);
     preadmit_               = admit_gpu_bytes_ > 0 && admit_structural_scale_ > 0;
@@ -2241,7 +2244,8 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
       projected = p > 0 ? static_cast<std::size_t>(p) : 0;
     }
     if (features.valid && admit_structural_scale_ > 0) {
-      projected = static_cast<std::size_t>(admit_structural_scale_ * features.need_fast);
+      projected = static_cast<std::size_t>(
+        admit_structural_scale_ * (admit_structural_min_ ? features.need_min : features.need_fast));
     }
   }
 

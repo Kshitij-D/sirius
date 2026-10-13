@@ -35,6 +35,7 @@
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/planner.hpp>
 #include <mutex>
+#include <cmath>
 #include <duckdb/planner/logical_operator.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 
@@ -208,18 +209,21 @@ void accumulate_features(duckdb::LogicalOperator& op,
   }
 }
 
-// Structural peak-memory walk over the logical plan. Sizes are DuckDB's
-// estimates; shape and constants come from how Sirius executes:
-//  - a scan pipeline keeps up to `threads` batches in flight, each costing 2x its
-//    bytes (Sirius's no-history per-operator default);
-//  - a join's hash table (~2x build bytes) lives while its probe side runs;
-//  - an aggregate holds ~2x its group bytes while its input streams, then its
-//    result stays materialized for the parent;
-//  - a sort holds ~2x its input.
+// Structural peak-memory walk over the logical plan (v2). Sizes are DuckDB's
+// estimates; shape and units come from how Sirius executes:
+//  - a scan task covers one stored chunk: chunks hold `batch_bytes` of the
+//    table's full row width, so a task reads chunk_rows x (width of the columns
+//    this query reads), and costs 2x that (Sirius's no-history operator rule);
+//    up to `threads` tasks are in flight;
+//  - a join's build side (2x its bytes) stays live while its probe side runs;
+//  - aggregate and sort state are materialized for the parent; aggregate state
+//    is bounded by Sirius's hash partitioning (at most `threads` partitions of
+//    one batch in flight), because DuckDB's GROUP BY row estimate is unreliable.
 struct walk_result {
-  double peak{0};   // need_fast: working + live state
-  double work{0};   // need_min: working batches only
+  double peak{0};   // need_fast: working tasks + live state
+  double work{0};   // need_min: working tasks only
   double held{0};   // bytes materialized for the parent
+  double task{0};   // bytes of one task of the pipeline feeding the parent
 };
 
 walk_result walk_peak(duckdb::LogicalOperator& op,
@@ -231,23 +235,26 @@ walk_result walk_peak(duckdb::LogicalOperator& op,
   auto bytes_of = [&](duckdb::LogicalOperator& o) { return card(o, ctx) * row_width(o.types); };
   switch (op.type) {
     case T::LOGICAL_GET: {
-      double base = bytes_of(op);
-      auto& get   = op.Cast<duckdb::LogicalGet>();
+      auto& get        = op.Cast<duckdb::LogicalGet>();
+      double rows      = card(op, ctx);
       if (get.function.cardinality) {
         auto stats = get.function.cardinality(ctx, get.bind_data.get());
         if (stats && stats->has_estimated_cardinality) {
-          duckdb::vector<duckdb::LogicalType> read_types;
-          for (auto const& col : get.GetColumnIds()) {
-            if (col.IsVirtualColumn()) { continue; }
-            auto idx = col.GetPrimaryIndex();
-            if (idx < get.returned_types.size()) { read_types.push_back(get.returned_types[idx]); }
-          }
-          base = static_cast<double>(stats->estimated_cardinality) * row_width(read_types);
+          rows = static_cast<double>(stats->estimated_cardinality);
         }
       }
-      double in_flight = std::min(base, threads * batch_bytes);
-      double w         = 2 * in_flight;
-      return {w, w, 0};
+      duckdb::vector<duckdb::LogicalType> read_types;
+      for (auto const& col : get.GetColumnIds()) {
+        if (col.IsVirtualColumn()) { continue; }
+        auto idx = col.GetPrimaryIndex();
+        if (idx < get.returned_types.size()) { read_types.push_back(get.returned_types[idx]); }
+      }
+      double full_w     = std::max(1.0, row_width(get.returned_types));
+      double chunk_rows = std::min(rows, batch_bytes / full_w);
+      double task       = chunk_rows * row_width(read_types);
+      double tasks      = std::max(1.0, std::ceil(rows / std::max(1.0, chunk_rows)));
+      double w          = 2 * task * std::min(threads, tasks);
+      return {w, w, 0, task};
     }
     case T::LOGICAL_COMPARISON_JOIN:
     case T::LOGICAL_DELIM_JOIN:
@@ -257,23 +264,23 @@ walk_result walk_peak(duckdb::LogicalOperator& op,
       if (op.children.size() != 2) { break; }
       auto build = walk_peak(*op.children[1], ctx, batch_bytes, threads);
       auto probe = walk_peak(*op.children[0], ctx, batch_bytes, threads);
-      double ht  = 2 * bytes_of(*op.children[1]);
-      return {std::max(build.peak, ht + probe.peak), std::max(build.work, probe.work), 0};
+      double ht  = 2 * std::min(bytes_of(*op.children[1]), build.held > 0 ? build.held : bytes_of(*op.children[1]));
+      return {std::max(build.peak, ht + probe.peak), std::max(build.work, probe.work), probe.held, probe.task};
     }
     case T::LOGICAL_AGGREGATE_AND_GROUP_BY:
     case T::LOGICAL_WINDOW: {
       if (op.children.empty()) { break; }
-      auto in    = walk_peak(*op.children[0], ctx, batch_bytes, threads);
-      double out = bytes_of(op);
-      return {in.peak + 2 * out, in.work, out};
+      auto in      = walk_peak(*op.children[0], ctx, batch_bytes, threads);
+      double state = std::min(bytes_of(op), threads * batch_bytes);
+      return {in.peak + 2 * state, in.work, state, in.task};
     }
     case T::LOGICAL_ORDER_BY:
     case T::LOGICAL_TOP_N: {
       if (op.children.empty()) { break; }
       auto in     = walk_peak(*op.children[0], ctx, batch_bytes, threads);
-      double data = bytes_of(*op.children[0]);
-      if (op.type == T::LOGICAL_TOP_N) { data = std::min(data, threads * batch_bytes); }
-      return {in.peak + 2 * data, in.work, data};
+      double data = in.held > 0 ? in.held : bytes_of(*op.children[0]);
+      if (op.type == T::LOGICAL_TOP_N) { data = std::min(data, threads * in.task); }
+      return {in.peak + 2 * data, in.work, data, in.task};
     }
     default: break;
   }
@@ -284,6 +291,7 @@ walk_result walk_peak(duckdb::LogicalOperator& op,
     auto c = walk_peak(*child, ctx, batch_bytes, threads);
     r.peak = std::max(r.peak, held_before + c.peak);
     r.work = std::max(r.work, c.work);
+    r.task = std::max(r.task, c.task);
     held_before += c.held;
   }
   r.held = held_before;

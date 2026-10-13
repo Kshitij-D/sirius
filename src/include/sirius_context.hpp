@@ -983,6 +983,7 @@ class SiriusContext : public ClientContextState {
   std::mutex footprint_log_mutex_;
   std::vector<double> plan_coefs_;
   double admit_structural_scale_{0};
+  bool admit_structural_min_{false};  // SIRIUS_ADMIT_STRUCTURAL_FIELD=min -> need_min
   double admit_learned_scale_{0};  // SIRIUS_ADMIT_LEARNED
   // fingerprint -> last few engine-ledger peaks; guarded by query_lifecycle_mutex_
   std::unordered_map<std::uint64_t, std::vector<std::size_t>> learned_peaks_;
