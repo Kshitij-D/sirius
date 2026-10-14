@@ -857,7 +857,8 @@ sirius_scan_manager::sirius_scan_manager(
   // is identical from the caller's point of view.  Both are built by the
   // ioctx registry, which sources the reactor staging resource from the
   // reservation manager it was constructed with.
-  if (_config.use_sirius_datasource) {
+  // SIRIUS_FORCE_KVIKIO (test runs on kernels without io_uring): take the kvikio path below.
+  if (_config.use_sirius_datasource && std::getenv("SIRIUS_FORCE_KVIKIO") == nullptr) {
     _io_ctx = _ioctx_registry.make_ioctx(sirius::io::io_context_type::uring);
     if (!_io_ctx) {
       throw std::runtime_error("[sirius_scan_manager] failed to create uring io_context");
