@@ -86,6 +86,7 @@ def main():
     p.add_argument("--workers", type=int, default=64, help="open loop: client connections available")
     p.add_argument("--benchmark", default="tpch", choices=["tpch", "tpcds"])
     p.add_argument("--tpcds-queries-dir", default="/scratch/general/vast/u1652955/tpcds_queries")
+    p.add_argument("--env", action="append", default=[], help="extra KEY=VALUE for the engine (repeatable)")
     p.add_argument("--querylog", action="store_true", help="per-query wait/run/projection/engine peak -> <out>.q.tsv")
     p.add_argument("--tasklog", action="store_true", help="per-task Sirius estimate vs actual to <out>.task.tsv")
     p.add_argument("--admit-structural-field", default=None, choices=["min", "fast"])
@@ -149,6 +150,8 @@ def main():
     if a.budget_drain_ms: os.environ["SIRIUS_BUDGET_DRAIN_MS"] = str(a.budget_drain_ms)
     if a.shared_scan_mb: os.environ["SIRIUS_SHARED_SCAN_MB"] = str(a.shared_scan_mb)
     if a.memory_manager: os.environ["SIRIUS_MEMORY_MANAGER"] = "1"
+    for kv in a.env:
+        k, _, v = kv.partition("="); os.environ[k] = v
     if a.querylog: os.environ["SIRIUS_QUERYLOG"] = os.path.abspath(a.out + ".q.tsv")
     if a.tasklog: os.environ["SIRIUS_TASKLOG"] = os.path.abspath(a.out + ".task.tsv")
     if a.admit_structural_field: os.environ["SIRIUS_ADMIT_STRUCTURAL_FIELD"] = a.admit_structural_field
