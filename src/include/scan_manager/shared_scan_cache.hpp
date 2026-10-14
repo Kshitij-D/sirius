@@ -60,6 +60,8 @@ class shared_scan_cache {
 
   [[nodiscard]] bool enabled() const noexcept { return _budget_bytes > 0 && _gpu_space != nullptr; }
   void set_gpu_space(cucascade::memory::memory_space* space) noexcept { _gpu_space = space; }
+  /// Programmatic budget (the memory manager sets it; the env var still applies otherwise).
+  void set_budget_bytes(std::size_t b) noexcept { _budget_bytes = b; }
   [[nodiscard]] cucascade::memory::memory_space* gpu_space() const noexcept { return _gpu_space; }
 
   [[nodiscard]] std::shared_ptr<cudf::column> get(std::string const& table, std::size_t chunk, std::size_t column)

@@ -67,6 +67,7 @@
 #include <cctype>
 #include "memory/query_memory_ledger.hpp"
 #include "pin_table.hpp"
+#include "pipeline/chain_memory_history.hpp"
 #include "scan_manager/shared_scan_cache.hpp"
 #include <chrono>
 #include <deque>
@@ -1038,18 +1039,24 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // behavior. Set before any query can reach acquire_query_lifecycle_slot.
   query_lifecycle_slots_ = std::max(1, config_.get_scan_manager_config().max_concurrent_queries);
   if (auto const* v = std::getenv("SIRIUS_MEMORY_MANAGER"); v != nullptr && std::string(v) == "1") {
-    // One switch for the whole manager; explicit env settings still win (overwrite=0).
-    memory_manager_mode_ = true;
-    ::setenv("SIRIUS_ADMIT_STRUCTURAL", "1.0", 0);
-    ::setenv("SIRIUS_ADMIT_STRUCTURAL_FIELD", "min", 0);
-    ::setenv("SIRIUS_ADMIT_LEARNED", "1.15", 0);
-    ::setenv("SIRIUS_ADMIT_RUNTIME", "1", 0);
-    ::setenv("SIRIUS_ADMIT_AGING_REL", "3", 0);
-    ::setenv("SIRIUS_TASK_CHAIN_HISTORY", "3", 0);
-    ::setenv("SIRIUS_BUDGET_DRAIN_MS", "10000", 0);
-    ::setenv("SIRIUS_AUTO_DEMOTE", "1", 0);
-    ::setenv("SIRIUS_SHARED_SCAN_MB", "2048", 0);
+    // One switch for the whole manager. Defaults go into members (never setenv: mutating the
+    // environment races with getenv on other threads); explicit env settings parsed below win.
+    memory_manager_mode_     = true;
+    admit_structural_scale_  = 1.0;
+    admit_structural_min_    = true;
+    admit_learned_scale_     = 1.15;
+    admit_runtime_           = true;
+    admit_aging_rel_         = 3;
+    auto_demote_             = true;
+    budget_drain_ms_         = 10000;
+    if (std::getenv("SIRIUS_TASK_CHAIN_HISTORY") == nullptr) {
+      sirius::pipeline::chain_memory_history::set_mode_override(3);
+    }
+    if (std::getenv("SIRIUS_SHARED_SCAN_MB") == nullptr) {
+      sirius::scan_manager::shared_scan_cache::instance().set_budget_bytes(2048ULL << 20);
+    }
   }
+  if (auto const* v = std::getenv("SIRIUS_BUDGET_DRAIN_MS")) { budget_drain_ms_ = std::atoi(v); }
   if (auto const* v = std::getenv("SIRIUS_ADMIT_GPU_BYTES")) {
     admit_gpu_bytes_ = std::stoull(v);
   }
@@ -1119,14 +1126,16 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
     config_.get_memory_space_configs());
-  if (memory_manager_mode_ && admit_gpu_bytes_ == 0) {
+  if (memory_manager_mode_) {
+   if (admit_gpu_bytes_ == 0) {
     // Budget derived from the engine's own GPU limit (minus a 2 GB transient margin).
     std::size_t limit = 0;
     for (auto const* sp : memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
       if (sp != nullptr) { limit += sp->get_max_memory(); }
     }
     admit_gpu_bytes_ = limit > (2ULL << 30) ? limit - (2ULL << 30) : limit;
-    preadmit_        = admit_gpu_bytes_ > 0 &&
+   }
+    preadmit_ = admit_gpu_bytes_ > 0 &&
                 (admit_structural_scale_ > 0 || admit_learned_scale_ > 0 || !plan_coefs_.empty());
   }
   start_memlog_if_requested();
@@ -2714,6 +2723,16 @@ void SiriusContext::start_memlog_if_requested()
 
 void SiriusContext::stop_memlog() noexcept
 {
+  // The shared-scan cache is process-wide: forget this context's GPU space on teardown so a
+  // later context (tests create many) never sees a dangling memory_space pointer.
+  {
+    auto& cache = sirius::scan_manager::shared_scan_cache::instance();
+    auto gpu_spaces = memory_manager_ ? memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)
+                                      : decltype(memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)){};
+    for (auto const* sp : gpu_spaces) {
+      if (sp != nullptr && cache.gpu_space() == sp) { cache.set_gpu_space(nullptr); }
+    }
+  }
   memlog_stop_.store(true);
   if (memlog_thread_.joinable()) { memlog_thread_.join(); }
   if (budget_thread_.joinable()) { budget_thread_.join(); }
@@ -2784,10 +2803,7 @@ void SiriusContext::start_budget_watcher_if_requested()
           // Drain-then-shrink (SIRIUS_BUDGET_DRAIN_MS > 0): when shrinking, let live
           // windows finish until allocations fit the new limit (bounded wait) before
           // cutting the engine's capacity, so running queries do not hit an OOM storm.
-          static int const drain_ms = [] {
-            auto const* v = std::getenv("SIRIUS_BUDGET_DRAIN_MS");
-            return v ? std::atoi(v) : 0;
-          }();
+          int const drain_ms = budget_drain_ms_;
           bool const shrinking = last_gb > 0 && gb < last_gb;
           if (shrinking && auto_demote_) { demote_for_budget(bytes); }
           auto const drain_start = std::chrono::steady_clock::now();

@@ -18,6 +18,7 @@
 
 #include "pipeline/pipeline_memory_history.hpp"
 
+#include <atomic>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
@@ -41,13 +42,23 @@ namespace sirius::pipeline {
  */
 class chain_memory_history {
  public:
+  /// Programmatic mode (the memory manager sets it; 0 = use the environment).
+  static void set_mode_override(int m) noexcept { override_slot().store(m, std::memory_order_relaxed); }
+
   static int mode()
   {
+    if (auto const o = override_slot().load(std::memory_order_relaxed); o > 0) { return o; }
     static int const m = [] {
       auto const* v = std::getenv("SIRIUS_TASK_CHAIN_HISTORY");
       return v ? std::atoi(v) : 0;
     }();
     return m;
+  }
+
+  static std::atomic<int>& override_slot() noexcept
+  {
+    static std::atomic<int> slot{0};
+    return slot;
   }
 
   static pipeline_memory_history& get(std::string const& chain)

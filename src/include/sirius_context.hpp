@@ -996,6 +996,7 @@ class SiriusContext : public ClientContextState {
   // from engine state; auto demotion/promotion of pinned tables on budget changes.
   bool memory_manager_mode_{false};
   bool auto_demote_{false};
+  int budget_drain_ms_{0};  // SIRIUS_BUDGET_DRAIN_MS
   double admit_aging_rel_{0};              // aging threshold = rel x median window run time
   std::deque<double> recent_run_ms_;       // guarded by query_lifecycle_mutex_
   std::vector<std::string> demoted_tables_;
