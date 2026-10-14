@@ -1,9 +1,9 @@
 """Final evaluation sweeps (resumable, randomized, fresh process per run).
 usage: python3 campaign7.py <slurm_jobid> [sections, default ABCDE]
-A budget sweep | B concurrency sweep | C oracle cap | D open loop | E TPC-DS | F lean-manager repeats
+A budget sweep | B concurrency sweep | C oracle cap | D open loop | E TPC-DS | F lean-manager repeats | G admission-scale sweep
 Runs a pre-flight (one TPC-DS and one open-loop run) first; sections whose pre-flight fails are skipped."""
 import glob, os, random, subprocess, sys
-J = sys.argv[1]; SECTIONS = sys.argv[2] if len(sys.argv) > 2 else "ABCDEF"; O = "results12"
+J = sys.argv[1]; SECTIONS = sys.argv[2] if len(sys.argv) > 2 else "GABCDEF"; O = "results12"
 D100, DDS = "/scratch/general/vast/u1652955/tpch_sf100", "/scratch/general/vast/u1652955/tpcds_sf10"
 REF100 = "/scratch/general/vast/u1652955/conc_bench/results2/sf100gpu_rtx_c1.json"
 LIGHT, HEAVY = "2,3,4,5,6,7,8,10,11,12,14,15,16,17,19,20,22", "1,9,13,18,21"
@@ -50,7 +50,27 @@ if "F" in SECTIONS:
         for p, a in (("manager_lean", LEAN), ("manager_lean_noage", LEAN_NOAGE)):
             jobs.append((f"host_sf10__{p}__r{r}", "/scratch/general/vast/u1652955/tpch_sf10", 16,
                          ["--pin", "host", "--host-gb", "16", "--rounds", "2"] + a))
-random.Random(700).shuffle(jobs)
+if "G" in SECTIONS:
+    # Admission budgets per query: 1.0 = today's projection (all pipeline threads busy);
+    # 0.25 ~= one task of the largest pipeline (minimum progress), leaving the rest to the
+    # task-level reservations + chain history.
+    SCG = {"warm_full": [], "warm_f75": ["--gpu-frac", "0.75"],
+           "shift_f75": ["--phases", f"{LIGHT};{HEAVY}", "--gpu-frac", "0.75"]}
+    for r in (1, 2):
+        for scen, extra in SCG.items():
+            frac = "0.75" if "f75" in scen else "0.90"
+            for sc in ("1.0", "0.5", "0.25"):
+                a = ["--admit-gb-auto", frac, "--admit-structural", sc, "--admit-structural-field", "min",
+                     "--task-chain-history", "3"]
+                jobs.append((f"G_{scen}__plan{sc}__r{r}", D100, 16, G + ["--serial-ref", REF100] + extra + a))
+            for sc in ("0.25",):
+                a = LEAN + ["--env", f"SIRIUS_ADMIT_STRUCTURAL={sc}"]
+                jobs.append((f"G_{scen}__lean{sc}__r{r}", D100, 16, G + ["--serial-ref", REF100] + extra + a))
+gjobs = [j for j in jobs if j[0].startswith("G_")]
+rest = [j for j in jobs if not j[0].startswith("G_")]
+random.Random(701).shuffle(gjobs)
+random.Random(700).shuffle(rest)
+jobs = gjobs + rest  # admission-scale sweep first: it decides how the paper frames the manager
 os.makedirs(O, exist_ok=True)
 def one(tag, data, c, args):
     return subprocess.run(["srun", "-M", "granite", f"--jobid={J}", "--overlap", "-n", "1", "-c", "16", "./run2.sh", f"../{O}/{tag}",
