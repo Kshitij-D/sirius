@@ -59,6 +59,7 @@ def main():
     p.add_argument("--admit-runtime", action="store_true", help="online correction from engine ledger")
     p.add_argument("--admit-aging-ms", type=int, default=0, help="starvation bound for waiting queries")
     p.add_argument("--admit-device-margin-gb", type=float, default=None, help="device-aware budget (margin GB)")
+    p.add_argument("--phases", default=None, help='shifting workload: "light-set;heavy-set": every client runs phase 1 then phase 2')
     p.add_argument("--groups", default=None, help='mixed workload: "1,9,13:4;6,14,19:12" = query subset:clients ...')
     p.add_argument("--admit-gb-auto", type=float, default=None,
                    help="for admission policies: budget = frac * device memory - 2 GB")
@@ -68,6 +69,9 @@ def main():
     p.add_argument("--admit-bestfit", action="store_true", help="largest fitting waiter first")
     p.add_argument("--stagger-heavy", type=int, default=0, help="max concurrent heavy merge/sort tasks")
     p.add_argument("--task-chain-history", type=int, default=0, help="cross-query chain history: 1 cold, 2 floor")
+    p.add_argument("--task-op-priors", action="store_true", help="per-operator priors for never-seen chains")
+    p.add_argument("--cotenant", default=None,
+                   help="delay_s,gib,hold_s: shrink Sirius budget at runtime, run a co-tenant hog, restore")
     p.add_argument("--querylog", action="store_true", help="per-query wait/run/projection/engine peak -> <out>.q.tsv")
     p.add_argument("--tasklog", action="store_true", help="per-task Sirius estimate vs actual to <out>.task.tsv")
     p.add_argument("--admit-structural-field", default=None, choices=["min", "fast"])
@@ -79,6 +83,7 @@ def main():
             lo, _, hi = part.partition("-"); out.update(range(int(lo), int(hi or lo) + 1))
         return out
     client_sets = None
+    phase_sets = None
     if a.groups:
         client_sets = []
         for g in a.groups.split(";"):
@@ -86,6 +91,9 @@ def main():
             client_sets += [parse(spec)] * int(n)
         a.clients = len(client_sets)
         qset = set().union(*client_sets)
+    elif a.phases:
+        phase_sets = [parse(x) for x in a.phases.split(";")]
+        qset = set().union(*phase_sets)
     else:
         qset = parse(a.queries)
     max_conc = a.max_conc or a.clients
@@ -115,11 +123,20 @@ def main():
     if a.admit_bestfit: os.environ["SIRIUS_ADMIT_BESTFIT"] = "1"
     if a.stagger_heavy: os.environ["SIRIUS_STAGGER_HEAVY"] = str(a.stagger_heavy)
     if a.task_chain_history: os.environ["SIRIUS_TASK_CHAIN_HISTORY"] = str(a.task_chain_history)
+    if a.task_op_priors: os.environ["SIRIUS_TASK_OP_PRIORS"] = "1"
     if a.querylog: os.environ["SIRIUS_QUERYLOG"] = os.path.abspath(a.out + ".q.tsv")
     if a.tasklog: os.environ["SIRIUS_TASKLOG"] = os.path.abspath(a.out + ".task.tsv")
     if a.admit_structural_field: os.environ["SIRIUS_ADMIT_STRUCTURAL_FIELD"] = a.admit_structural_field
     if a.admit_structural: os.environ["SIRIUS_ADMIT_STRUCTURAL"] = str(a.admit_structural)
     if a.admit_default_gb: os.environ["SIRIUS_ADMIT_DEFAULT_BYTES"] = str(int(a.admit_default_gb * (1 << 30)))
+    budget_file = None
+    if a.cotenant:
+        import subprocess as _sp
+        tot_gib = int(_sp.check_output(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"]).split()[0]) / 1024
+        budget_file = os.path.abspath(a.out + ".budget")
+        R0_budget = a.gpu_frac * tot_gib
+        open(budget_file, "w").write(f"{R0_budget:.2f}\n")
+        os.environ["SIRIUS_BUDGET_FILE"] = budget_file
     os.environ["SIRIUS_PIN_TIER"] = a.pin if a.pin != "none" else "gpu"
 
     R = dict(args=vars(a), max_conc=max_conc, marks={})
@@ -166,10 +183,19 @@ def main():
     log, errors = [], []
     def client(i):
         c = curs[i]; barrier.wait()
+        order = []
         for r in range(a.rounds):
+            so = stream_order(1 + i + r * a.clients)
+            if phase_sets:
+                continue
             mine = client_sets[i] if client_sets else qset
-            for q in stream_order(1 + i + r * a.clients):
-                if q not in mine: continue
+            order += [q for q in so if q in mine]
+        if phase_sets:
+            for ps in phase_sets:
+                for r in range(a.rounds):
+                    order += [q for q in stream_order(1 + i + r * a.clients) if q in ps]
+        for q in order:
+            if True:
                 t0 = now()
                 try: c.execute(QUERIES[f"q{q}"]).fetchall()
                 except Exception as e: errors.append((i, q, repr(e)[:300]))
@@ -177,6 +203,19 @@ def main():
     th = [threading.Thread(target=client, args=(i,)) for i in range(a.clients)]
     for x in th: x.start()
     ru0 = resource.getrusage(resource.RUSAGE_SELF); barrier.wait(); t0 = now()
+    if a.cotenant:
+        def cotenant():
+            import subprocess as _sp
+            d, g, h = (float(x) for x in a.cotenant.split(","))
+            time.sleep(d)
+            R["marks"]["cotenant_shrink"] = now()
+            open(budget_file, "w").write(f"{R0_budget - g - 1:.2f}\n")
+            hog_out = _sp.run([os.path.join(os.path.dirname(os.path.abspath(__file__)), "hog"), "0", str(g), str(h), "30"],
+                              stdout=_sp.PIPE, stderr=_sp.STDOUT, universal_newlines=True).stdout
+            R["cotenant_hog"] = hog_out.strip()
+            R["marks"]["cotenant_restore"] = now()
+            open(budget_file, "w").write(f"{R0_budget:.2f}\n")
+        threading.Thread(target=cotenant, daemon=True).start()
     hog = None
     if a.hog:
         import subprocess

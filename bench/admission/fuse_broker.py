@@ -20,9 +20,12 @@ def main():
     ap.add_argument("--data", required=True); ap.add_argument("--pin", default="host")
     ap.add_argument("--host-gb", type=int, default=24); ap.add_argument("--clients", type=int, default=16)
     ap.add_argument("--per-client", type=int, default=8); ap.add_argument("--kmax", type=int, default=16)
-    ap.add_argument("--mode", choices=["concurrent", "broker"], required=True)
+    ap.add_argument("--mode", choices=["concurrent", "broker", "auto"], required=True)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
+    # Tier-aware choice: fuse only when the scanned table lives behind PCIe (host tier);
+    # with GPU-resident data there is no transfer to share and concurrency wins.
+    a.chosen = ("broker" if a.pin == "host" else "concurrent") if a.mode == "auto" else a.mode
     cfg = os.path.abspath(a.out + ".yaml")
     open(cfg, "w").write(run_conc.CONFIG.format(host_bytes=a.host_gb << 30, host_pools=(a.host_gb << 30) // (8 * 67108864),
         disk_dir="/scratch/general/vast/u1652955/sirius_disk", scan_threads=4, max_conc=a.clients, pipe_threads=4,
@@ -49,7 +52,7 @@ def main():
     lat, batches = [], []
     lock = threading.Lock()
     bar = threading.Barrier(a.clients + 1)
-    if a.mode == "concurrent":
+    if a.chosen == "concurrent":
         def client(i):
             bar.wait()
             for p in work[i]:
@@ -83,13 +86,13 @@ def main():
     bar.wait(); t0 = time.time()
     for x in th: x.join()
     mk = time.time() - t0
-    if a.mode == "broker": stop.set()
+    if a.chosen == "broker": stop.set()
     L = sorted(lat)
     pct = lambda q: L[min(len(L) - 1, int(q * len(L)))]
     R = dict(args=vars(a), makespan_s=mk, n=len(L), qps=len(L) / mk, p50=pct(.5), p95=pct(.95), p99=pct(.99),
              mean_batch=statistics.mean(batches) if batches else 1, fused_correct=ok)
     json.dump(R, open(a.out + ".json", "w"), indent=1)
-    print(f"mode={a.mode} pin={a.pin} qps={R['qps']:.2f} p50={R['p50']*1e3:.0f}ms p95={R['p95']*1e3:.0f}ms "
+    print(f"mode={a.mode}->{a.chosen} pin={a.pin} qps={R['qps']:.2f} p50={R['p50']*1e3:.0f}ms p95={R['p95']*1e3:.0f}ms "
           f"p99={R['p99']*1e3:.0f}ms mean_batch={R['mean_batch']:.1f} fused_correct={ok}", flush=True)
     os._exit(0)
 

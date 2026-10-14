@@ -858,6 +858,27 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
     }
     // Preserve the task-level 2× fallback when no operator supplies a positive estimate.
     info.peak_memory_estimate = (max_estimate > 0) ? max_estimate : (input_basis * 2);
+    // Never-seen chain (experimental, SIRIUS_TASK_OP_PRIORS=1): raise the cold estimate
+    // to a per-operator peak/input ratio measured from Sirius task logs (p90 at
+    // non-trivial inputs, TPC-H SF100). Only ever raises.
+    static bool const op_priors = [] {
+      auto const* v = std::getenv("SIRIUS_TASK_OP_PRIORS");
+      return v != nullptr && std::string(v) == "1";
+    }();
+    if (op_priors && input_basis > 0) {
+      double ratio = 0;
+      if (auto* pipeline = gs.get_pipeline()) {
+        for (auto& op_ref : pipeline->get_operators()) {
+          auto const name = op_ref.get().get_name();
+          if (name == "HASH_GROUP_BY") { ratio = std::max(ratio, 4.6); }
+          if (name == "HASH_JOIN") { ratio = std::max(ratio, 3.9); }
+          if (name == "MERGE_GROUP_BY") { ratio = std::max(ratio, 3.5); }
+          if (name == "ORDER_BY") { ratio = std::max(ratio, 3.0); }
+        }
+      }
+      auto const prior = static_cast<std::size_t>(ratio * static_cast<double>(input_basis));
+      info.peak_memory_estimate = std::max(info.peak_memory_estimate, prior);
+    }
   }
 
   info.reservation_size = info.peak_memory_estimate + bytes_to_materialize;

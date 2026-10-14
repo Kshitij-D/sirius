@@ -1102,6 +1102,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
     config_.get_memory_space_configs());
   start_memlog_if_requested();
+  start_budget_watcher_if_requested();
   if (admit_gpu_bytes_ > 0) {
     SIRIUS_LOG_INFO(
       "SiriusContext: {} admission at {} GPU bytes, gap {} ms, {} footprints, default {}",
@@ -2512,7 +2513,7 @@ void SiriusContext::start_memlog_if_requested()
   memlog_thread_ = std::thread([this, file = std::string(path)] {
     std::FILE* f = std::fopen(file.c_str(), "w");
     if (f == nullptr) { return; }
-    std::fprintf(f, "t,gpu_alloc,gpu_reserved,gpu_avail,host_reserved,live,waiting\n");
+    std::fprintf(f, "t,gpu_alloc,gpu_reserved,gpu_avail,host_reserved,live,waiting,budget\n");
     using namespace std::chrono;
     while (!memlog_stop_.load(std::memory_order_relaxed)) {
       double t = duration<double>(system_clock::now().time_since_epoch()).count();
@@ -2531,14 +2532,15 @@ void SiriusContext::start_memlog_if_requested()
         waiting = query_lifecycle_waiting_;
       }
       std::fprintf(f,
-                   "%.4f,%zu,%zu,%zu,%zu,%d,%d\n",
+                   "%.4f,%zu,%zu,%zu,%zu,%d,%d,%zu\n",
                    t,
                    gpu_allocated_bytes(),
                    gres,
                    memory_manager_->get_available_memory_for_tier(cucascade::memory::Tier::GPU),
                    memory_manager_->get_total_reserved_memory_for_tier(cucascade::memory::Tier::HOST),
                    live,
-                   waiting);
+                   waiting,
+                   current_budget_bytes_.load());
       std::fflush(f);
       std::this_thread::sleep_for(milliseconds(10));
     }
@@ -2550,6 +2552,38 @@ void SiriusContext::stop_memlog() noexcept
 {
   memlog_stop_.store(true);
   if (memlog_thread_.joinable()) { memlog_thread_.join(); }
+  if (budget_thread_.joinable()) { budget_thread_.join(); }
+}
+
+void SiriusContext::start_budget_watcher_if_requested()
+{
+  auto const* path = std::getenv("SIRIUS_BUDGET_FILE");
+  if (path == nullptr || *path == '\0') { return; }
+  budget_thread_ = std::thread([this, file = std::string(path)] {
+    double last_gb = -1;
+    while (!memlog_stop_.load(std::memory_order_relaxed)) {
+      if (std::FILE* f = std::fopen(file.c_str(), "r")) {
+        double gb = -1;
+        if (std::fscanf(f, "%lf", &gb) == 1 && gb > 0 && gb != last_gb) {
+          auto const bytes = static_cast<std::size_t>(gb * (1ULL << 30));
+          for (auto* sp : memory_manager_->get_mutable_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+            if (sp != nullptr) { sp->set_memory_limit(bytes); }
+          }
+          {
+            std::lock_guard<std::mutex> lock(query_lifecycle_mutex_);
+            if (admit_gpu_bytes_ > 0) {
+              admit_gpu_bytes_ = bytes > (2ULL << 30) ? bytes - (2ULL << 30) : bytes;
+            }
+          }
+          current_budget_bytes_.store(bytes);
+          SIRIUS_LOG_INFO("SiriusContext: GPU budget set to {:.1f} GB at runtime", gb);
+          last_gb = gb;
+        }
+        std::fclose(f);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  });
 }
 
 // ================= Free Functions ================= //

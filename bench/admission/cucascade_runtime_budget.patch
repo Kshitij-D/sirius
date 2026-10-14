@@ -1,0 +1,148 @@
+diff --git a/include/cucascade/memory/detail/reservation_aware_resource_adaptor_impl.hpp b/include/cucascade/memory/detail/reservation_aware_resource_adaptor_impl.hpp
+index df6c705..203fb6d 100644
+--- a/include/cucascade/memory/detail/reservation_aware_resource_adaptor_impl.hpp
++++ b/include/cucascade/memory/detail/reservation_aware_resource_adaptor_impl.hpp
+@@ -161,6 +161,8 @@ class reservation_aware_resource_adaptor_impl {
+   std::size_t get_total_allocated_bytes() const;
+   std::size_t get_peak_total_allocated_bytes() const;
+   void reset_peak_allocated_bytes(rmm::cuda_stream_view stream);
++  void reset_peak_total_allocated_bytes();
++  void set_limits(std::size_t memory_limit, std::size_t capacity);
+   std::size_t get_total_reserved_bytes() const;
+   bool is_stream_tracked(rmm::cuda_stream_view stream) const;
+ 
+@@ -239,8 +241,8 @@ class reservation_aware_resource_adaptor_impl {
+   memory_space_id _space_id;
+   rmm::device_async_resource_ref _upstream;
+   cudaMemPool_t _pool_handle{nullptr};
+-  const std::size_t _memory_limit;
+-  const std::size_t _capacity;
++  std::size_t _memory_limit;  // mutable at runtime via set_limits (experimental)
++  std::size_t _capacity;
+   std::unique_ptr<allocation_tracker_iface> _allocation_tracker;
+   std::atomic<size_t> _total_reserved_bytes{0UL};
+   std::atomic<size_t> _number_of_allocations{0UL};
+diff --git a/include/cucascade/memory/memory_space.hpp b/include/cucascade/memory/memory_space.hpp
+index e961fab..fa3ee43 100644
+--- a/include/cucascade/memory/memory_space.hpp
++++ b/include/cucascade/memory/memory_space.hpp
+@@ -115,6 +115,15 @@ class memory_space {
+   [[nodiscard]] size_t get_total_reserved_memory() const;
+   [[nodiscard]] size_t get_max_memory() const noexcept;
+ 
++  /**
++   * @brief Change this GPU space's budget at runtime (experimental).
++   *
++   * Scales capacity, reservation limit and downgrade thresholds to the new
++   * limit, and trims the CUDA memory pool so freed memory returns to the device
++   * (co-tenants can then allocate it). Granted reservations are not revoked.
++   */
++  void set_memory_limit(size_t new_limit);
++
+   // Allocator management
+   [[nodiscard]] rmm::device_async_resource_ref get_default_allocator() const noexcept;
+ 
+@@ -162,10 +171,11 @@ class memory_space {
+   friend class reservation;
+ 
+   const memory_space_id _id;
+-  const size_t _capacity;
+-  const size_t _memory_limit;
+-  const size_t _start_downgrading_memory_threshold;
+-  const size_t _stop_downgrading_memory_threshold;
++  // Mutable at runtime (experimental): see set_memory_limit().
++  size_t _capacity;
++  size_t _memory_limit;
++  size_t _start_downgrading_memory_threshold;
++  size_t _stop_downgrading_memory_threshold;
+   using reserving_adaptor_type = std::variant<std::unique_ptr<reservation_aware_resource_adaptor>,
+                                               std::unique_ptr<fixed_size_host_memory_resource>,
+                                               std::unique_ptr<disk_access_limiter>>;
+diff --git a/include/cucascade/memory/reservation_aware_resource_adaptor.hpp b/include/cucascade/memory/reservation_aware_resource_adaptor.hpp
+index 53f4b8c..0ec1382 100644
+--- a/include/cucascade/memory/reservation_aware_resource_adaptor.hpp
++++ b/include/cucascade/memory/reservation_aware_resource_adaptor.hpp
+@@ -159,6 +159,17 @@ class reservation_aware_resource_adaptor
+    */
+   void reset_peak_allocated_bytes(rmm::cuda_stream_view stream);
+ 
++  /**
++   * @brief Resets the peak total allocated bytes to the current total.
++   */
++  void reset_peak_total_allocated_bytes();
++
++  /**
++   * @brief Change the reservation limit and allocation capacity at runtime, and
++   * trim the CUDA pool to the new capacity (experimental).
++   */
++  void set_limits(std::size_t memory_limit, std::size_t capacity);
++
+   /**
+    * @brief Gets the total reserved bytes across all streams.
+    * @return The total reserved bytes
+diff --git a/src/memory/memory_space.cpp b/src/memory/memory_space.cpp
+index bebd99b..db167a3 100644
+--- a/src/memory/memory_space.cpp
++++ b/src/memory/memory_space.cpp
+@@ -375,6 +375,21 @@ size_t memory_space::get_total_reserved_memory() const
+ 
+ size_t memory_space::get_max_memory() const noexcept { return _memory_limit; }
+ 
++void memory_space::set_memory_limit(size_t new_limit)
++{
++  if (_memory_limit == 0 || new_limit == 0) { return; }
++  double const scale = static_cast<double>(new_limit) / static_cast<double>(_memory_limit);
++  _start_downgrading_memory_threshold =
++    static_cast<size_t>(static_cast<double>(_start_downgrading_memory_threshold) * scale);
++  _stop_downgrading_memory_threshold =
++    static_cast<size_t>(static_cast<double>(_stop_downgrading_memory_threshold) * scale);
++  _capacity     = static_cast<size_t>(static_cast<double>(_capacity) * scale);
++  _memory_limit = new_limit;
++  if (auto* mr = get_memory_resource_as<reservation_aware_resource_adaptor>()) {
++    mr->set_limits(_memory_limit, _capacity);
++  }
++}
++
+ rmm::device_async_resource_ref memory_space::get_default_allocator() const noexcept
+ {
+   return std::visit(
+diff --git a/src/memory/reservation_aware_resource_adaptor.cpp b/src/memory/reservation_aware_resource_adaptor.cpp
+index 2d58fea..72a4b68 100644
+--- a/src/memory/reservation_aware_resource_adaptor.cpp
++++ b/src/memory/reservation_aware_resource_adaptor.cpp
+@@ -320,6 +320,18 @@ std::size_t impl_type::get_peak_total_allocated_bytes() const
+   return _peak_total_allocated_bytes.peak();
+ }
+ 
++void impl_type::set_limits(std::size_t memory_limit, std::size_t capacity)
++{
++  _memory_limit = memory_limit;
++  _capacity     = capacity;
++  if (_pool_handle != nullptr) { cudaMemPoolTrimTo(_pool_handle, capacity); }
++}
++
++void impl_type::reset_peak_total_allocated_bytes()
++{
++  _peak_total_allocated_bytes.reset(_total_allocated_bytes.load());
++}
++
+ void impl_type::reset_peak_allocated_bytes(rmm::cuda_stream_view stream)
+ {
+   auto* stats = _allocation_tracker->get_tracker_state(stream);
+@@ -656,6 +668,16 @@ std::size_t reservation_aware_resource_adaptor::get_peak_total_allocated_bytes()
+   return get().get_peak_total_allocated_bytes();
+ }
+ 
++void reservation_aware_resource_adaptor::set_limits(std::size_t memory_limit, std::size_t capacity)
++{
++  get().set_limits(memory_limit, capacity);
++}
++
++void reservation_aware_resource_adaptor::reset_peak_total_allocated_bytes()
++{
++  get().reset_peak_total_allocated_bytes();
++}
++
+ void reservation_aware_resource_adaptor::reset_peak_allocated_bytes(rmm::cuda_stream_view stream)
+ {
+   get().reset_peak_allocated_bytes(stream);

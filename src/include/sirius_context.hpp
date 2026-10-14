@@ -1025,6 +1025,11 @@ class SiriusContext : public ClientContextState {
   std::size_t gpu_peak_bytes() const;
   std::atomic<bool> memlog_stop_{false};
   std::thread memlog_thread_;
+  // SIRIUS_BUDGET_FILE (experimental): a file holding the GPU budget in GB; a
+  // watcher applies changes at runtime to the GPU memory spaces and admission.
+  std::thread budget_thread_;
+  std::atomic<std::size_t> current_budget_bytes_{0};
+  void start_budget_watcher_if_requested();
   std::size_t gpu_allocated_bytes() const;
   void start_memlog_if_requested();
   void stop_memlog() noexcept;
