@@ -72,6 +72,7 @@ def main():
     p.add_argument("--task-op-priors", action="store_true", help="per-operator priors for never-seen chains")
     p.add_argument("--cotenant", default=None,
                    help="delay_s,gib,hold_s: shrink Sirius budget at runtime, run a co-tenant hog, restore")
+    p.add_argument("--budget-drain-ms", type=int, default=0, help="drain-then-shrink bound for runtime budget cuts")
     p.add_argument("--querylog", action="store_true", help="per-query wait/run/projection/engine peak -> <out>.q.tsv")
     p.add_argument("--tasklog", action="store_true", help="per-task Sirius estimate vs actual to <out>.task.tsv")
     p.add_argument("--admit-structural-field", default=None, choices=["min", "fast"])
@@ -124,6 +125,7 @@ def main():
     if a.stagger_heavy: os.environ["SIRIUS_STAGGER_HEAVY"] = str(a.stagger_heavy)
     if a.task_chain_history: os.environ["SIRIUS_TASK_CHAIN_HISTORY"] = str(a.task_chain_history)
     if a.task_op_priors: os.environ["SIRIUS_TASK_OP_PRIORS"] = "1"
+    if a.budget_drain_ms: os.environ["SIRIUS_BUDGET_DRAIN_MS"] = str(a.budget_drain_ms)
     if a.querylog: os.environ["SIRIUS_QUERYLOG"] = os.path.abspath(a.out + ".q.tsv")
     if a.tasklog: os.environ["SIRIUS_TASKLOG"] = os.path.abspath(a.out + ".task.tsv")
     if a.admit_structural_field: os.environ["SIRIUS_ADMIT_STRUCTURAL_FIELD"] = a.admit_structural_field

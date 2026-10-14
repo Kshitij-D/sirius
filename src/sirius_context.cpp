@@ -2566,15 +2566,37 @@ void SiriusContext::start_budget_watcher_if_requested()
         double gb = -1;
         if (std::fscanf(f, "%lf", &gb) == 1 && gb > 0 && gb != last_gb) {
           auto const bytes = static_cast<std::size_t>(gb * (1ULL << 30));
-          // Same pattern as pin_table: the public accessor is const; the space itself is mutable.
-          for (auto const* sp : memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
-            if (sp != nullptr) { const_cast<cucascade::memory::memory_space*>(sp)->set_memory_limit(bytes); }
-          }
+          // Admission budget first: no new window is admitted beyond the new limit.
           {
             std::lock_guard<std::mutex> lock(query_lifecycle_mutex_);
             if (admit_gpu_bytes_ > 0) {
               admit_gpu_bytes_ = bytes > (2ULL << 30) ? bytes - (2ULL << 30) : bytes;
             }
+          }
+          // Drain-then-shrink (SIRIUS_BUDGET_DRAIN_MS > 0): when shrinking, let live
+          // windows finish until allocations fit the new limit (bounded wait) before
+          // cutting the engine's capacity, so running queries do not hit an OOM storm.
+          static int const drain_ms = [] {
+            auto const* v = std::getenv("SIRIUS_BUDGET_DRAIN_MS");
+            return v ? std::atoi(v) : 0;
+          }();
+          bool const shrinking = last_gb > 0 && gb < last_gb;
+          auto const drain_start = std::chrono::steady_clock::now();
+          if (shrinking && drain_ms > 0) {
+            while (gpu_allocated_bytes() > bytes &&
+                   std::chrono::steady_clock::now() - drain_start < std::chrono::milliseconds(drain_ms) &&
+                   !memlog_stop_.load(std::memory_order_relaxed)) {
+              std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+          }
+          double const drained_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - drain_start).count();
+          // Same pattern as pin_table: the public accessor is const; the space itself is mutable.
+          for (auto const* sp : memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+            if (sp != nullptr) { const_cast<cucascade::memory::memory_space*>(sp)->set_memory_limit(bytes); }
+          }
+          if (shrinking) {
+            SIRIUS_LOG_INFO("SiriusContext: budget shrink drained for {:.0f} ms", drained_ms);
           }
           current_budget_bytes_.store(bytes);
           SIRIUS_LOG_INFO("SiriusContext: GPU budget set to {:.1f} GB at runtime", gb);

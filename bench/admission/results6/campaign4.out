@@ -1,0 +1,13 @@
+host_sf10__plan_chain3__r1: clients=16 makespan=8.37s qps=42.04 speedup_vs_serial=2.96 inflight=15.67 cpu_cores=8.07 errors=0 fallbacks=0 oom_retries=0 plan_fallbacks=0
+broker_gpu__auto__r1: mode=auto->concurrent pin=gpu qps=68.05 p50=246ms p95=298ms p99=301ms mean_batch=1.0 fused_correct=True
+cold_f75p__plan_chain3__r1: clients=16 makespan=34.43s qps=10.22 speedup_vs_serial=1.37 inflight=13.25 cpu_cores=6.62 errors=0 fallbacks=0 oom_retries=2 plan_fallbacks=0
+cotenant__ours2_dev__r1: clients=16 makespan=36.68s qps=9.60 speedup_vs_serial=1.29 inflight=15.27 cpu_cores=8.07 errors=0 fallbacks=1 oom_retries=330 plan_fallbacks=0 [1 fallback msgs]
+broker_host__auto__r1: mode=auto->broker pin=host qps=17.99 p50=889ms p95=904ms p99=907ms mean_batch=8.0 fused_correct=True
+cotenant__ours2__r1: clients=16 makespan=73.21s qps=4.81 speedup_vs_serial=0.65 inflight=8.37 cpu_cores=8.52 errors=0 fallbacks=5 oom_retries=232 plan_fallbacks=0 [5 fallback msgs]
+host_sf10__ours2__r1: clients=16 makespan=8.35s qps=42.15 speedup_vs_serial=2.45 inflight=15.77 cpu_cores=8.17 errors=0 fallbacks=0 oom_retries=0 plan_fallbacks=0
+cotenant__cap4__r1: clients=16 makespan=35.84s qps=9.82 speedup_vs_serial=1.32 inflight=15.56 cpu_cores=8.47 errors=0 fallbacks=2 oom_retries=936 plan_fallbacks=0 [2 fallback msgs]
+host_sf10__cap4__r1: clients=16 makespan=9.21s qps=38.20 speedup_vs_serial=2.39 inflight=15.38 cpu_cores=7.75 errors=0 fallbacks=0 oom_retries=0 plan_fallbacks=0
+cold_f75p__plan_chain3_pri__r1: clients=16 makespan=34.46s qps=10.22 speedup_vs_serial=1.37 inflight=13.60 cpu_cores=6.63 errors=0 fallbacks=0 oom_retries=0 plan_fallbacks=0
+cotenant__plan_chain3__r1: clients=16 makespan=34.73s qps=10.14 speedup_vs_serial=1.36 inflight=14.62 cpu_cores=11.33 errors=0 fallbacks=3 oom_retries=214 plan_fallbacks=0 [3 fallback msgs]
+REPEAT_DONE 1
+CAMPAIGN4DONE
