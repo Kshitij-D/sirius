@@ -1,0 +1,21 @@
+{
+ "args": {
+  "data": "/scratch/general/vast/u1652955/tpch_sf100",
+  "pin": "host",
+  "host_gb": 24,
+  "clients": 16,
+  "per_client": 4,
+  "kmax": 16,
+  "mode": "concurrent",
+  "out": "results7/broker_host__concurrent__r3",
+  "chosen": "concurrent"
+ },
+ "makespan_s": 11.43332576751709,
+ "n": 64,
+ "qps": 5.597671342648931,
+ "p50": 2.8755056858062744,
+ "p95": 2.968708038330078,
+ "p99": 2.970006227493286,
+ "mean_batch": 1,
+ "fused_correct": true
+}

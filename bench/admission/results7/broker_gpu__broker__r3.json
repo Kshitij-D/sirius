@@ -1,0 +1,21 @@
+{
+ "args": {
+  "data": "/scratch/general/vast/u1652955/tpch_sf100",
+  "pin": "gpu",
+  "host_gb": 24,
+  "clients": 16,
+  "per_client": 8,
+  "kmax": 16,
+  "mode": "broker",
+  "out": "results7/broker_gpu__broker__r3",
+  "chosen": "broker"
+ },
+ "makespan_s": 5.324633836746216,
+ "n": 128,
+ "qps": 24.039211695018338,
+ "p50": 0.6713588237762451,
+ "p95": 0.7143669128417969,
+ "p99": 0.7152478694915771,
+ "mean_batch": 8,
+ "fused_correct": true
+}
