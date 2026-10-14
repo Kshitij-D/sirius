@@ -2566,8 +2566,9 @@ void SiriusContext::start_budget_watcher_if_requested()
         double gb = -1;
         if (std::fscanf(f, "%lf", &gb) == 1 && gb > 0 && gb != last_gb) {
           auto const bytes = static_cast<std::size_t>(gb * (1ULL << 30));
-          for (auto* sp : memory_manager_->get_mutable_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
-            if (sp != nullptr) { sp->set_memory_limit(bytes); }
+          // Same pattern as pin_table: the public accessor is const; the space itself is mutable.
+          for (auto const* sp : memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+            if (sp != nullptr) { const_cast<cucascade::memory::memory_space*>(sp)->set_memory_limit(bytes); }
           }
           {
             std::lock_guard<std::mutex> lock(query_lifecycle_mutex_);
