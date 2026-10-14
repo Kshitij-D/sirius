@@ -2583,7 +2583,14 @@ void SiriusContext::start_budget_watcher_if_requested()
           bool const shrinking = last_gb > 0 && gb < last_gb;
           auto const drain_start = std::chrono::steady_clock::now();
           if (shrinking && drain_ms > 0) {
-            while (gpu_allocated_bytes() > bytes &&
+            // Drain on what admission has committed (resident data plus every live
+            // window's projection or engine-held bytes), not on an instantaneous
+            // allocation snapshot: admitted queries keep launching tasks after the cut.
+            auto committed_now = [this] {
+              std::lock_guard<std::mutex> lock(query_lifecycle_mutex_);
+              return std::max(gpu_allocated_bytes(), query_lifecycle_active_ > 0 ? committed_bytes() : 0);
+            };
+            while (committed_now() > bytes &&
                    std::chrono::steady_clock::now() - drain_start < std::chrono::milliseconds(drain_ms) &&
                    !memlog_stop_.load(std::memory_order_relaxed)) {
               std::this_thread::sleep_for(std::chrono::milliseconds(10));
