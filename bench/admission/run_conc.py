@@ -75,6 +75,8 @@ def main():
     p.add_argument("--budget-drain-ms", type=int, default=0, help="drain-then-shrink bound for runtime budget cuts")
     p.add_argument("--demote", default=None,
                    help="with --cotenant: tables to unpin (GPU -> storage) before the budget cut, re-pinned after restore")
+    p.add_argument("--demote-need-gb", type=float, default=11.0,
+                   help="--demote auto: largest single-query GPU need the shrunk budget must still cover")
     p.add_argument("--querylog", action="store_true", help="per-query wait/run/projection/engine peak -> <out>.q.tsv")
     p.add_argument("--tasklog", action="store_true", help="per-task Sirius estimate vs actual to <out>.task.tsv")
     p.add_argument("--admit-structural-field", default=None, choices=["min", "fast"])
@@ -152,8 +154,14 @@ def main():
         if s.strip(): con.execute(s).fetchall()
     if a.pin != "none":
         t = now()
-        for s in emit_pin_all(a.data).split(";"):
-            if s.strip(): con.execute(s).fetchall()
+        from tpch_pin_columns import union_columns_by_table, _pin_call
+        pin_marks = []
+        for tbl, cols in union_columns_by_table().items():
+            tb = now()
+            for st in _pin_call(tbl, cols, a.data, "parquet").split(";"):
+                if st.strip(): con.execute(st).fetchall()
+            pin_marks.append((tbl, tb, now()))
+        R["pin_marks"] = pin_marks
         R["pin_s"] = now() - t
     print(f"loaded+pinned in {now()-t:.1f}s", flush=True)
 
@@ -212,6 +220,35 @@ def main():
             import subprocess as _sp
             d, g, h = (float(x) for x in a.cotenant.split(","))
             time.sleep(d)
+            if a.demote == "auto":
+                # Choose victims: least query use per resident GB first, until the shrunk
+                # budget covers resident data + the largest single-query need.
+                import csv as _csv
+                from tpch_pin_columns import QUERY_COLUMNS
+                rows = list(_csv.DictReader(open(a.out + ".mem.csv")))
+                def alloc_at(t):
+                    best = min(rows, key=lambda r: abs(float(r["t"]) - t))
+                    return int(best["gpu_alloc"])
+                tbytes = {tbl: max(0, alloc_at(t1) - alloc_at(t0)) for tbl, t0, t1 in R["pin_marks"]}
+                uses = {tbl: sum(1 for q, ct in QUERY_COLUMNS.items() if q in qset and tbl in ct) for tbl in tbytes}
+                resident = sum(tbytes.values())
+                deficit = resident + a.demote_need_gb * 2**30 - (R0_budget - g - 1) * 2**30
+                # Cost of demoting a set = data the workload must now read from storage,
+                # sum(uses x bytes); pick the cheapest set that covers the deficit (8 tables:
+                # exhaustive over subsets).
+                import itertools
+                cand = [t for t in tbytes if tbytes[t] > 0]
+                best = None
+                for k in range(1, len(cand) + 1):
+                    for combo in itertools.combinations(cand, k):
+                        fb = sum(tbytes[t] for t in combo)
+                        if fb < deficit: continue
+                        cost = sum(uses[t] * tbytes[t] for t in combo)
+                        if best is None or cost < best[0]: best = (cost, combo, fb)
+                chosen, freed = (list(best[1]), best[2]) if best else ([], 0)
+                R["demote_plan"] = dict(table_gb={k: round(v / 2**30, 2) for k, v in tbytes.items()}, uses=uses,
+                                        deficit_gb=round(deficit / 2**30, 2), chosen=chosen, freed_gb=round(freed / 2**30, 2))
+                a.demote = ",".join(chosen)
             if a.demote:
                 # Placement decision: give up residency of the named tables so the shrunk
                 # budget still covers the working set, instead of an OOM storm.
