@@ -960,6 +960,7 @@ class SiriusContext : public ClientContextState {
   //   SIRIUS_ADMIT_DEVICE_MARGIN_GB  also cap the budget at what the device
   //                           really has (Sirius allocations + cudaMemGetInfo
   //                           free - margin), so co-tenants shrink it online.
+  //   SIRIUS_ADMIT_BESTFIT 1  among waiters, the largest one that fits goes first.
   //   SIRIUS_ADMIT_AGING_MS   a waiter older than this reserves room: younger
   //                           windows are admitted only if it would still fit.
   //   SIRIUS_QUERYLOG         TSV: per window fingerprint, wait, run time,
@@ -989,6 +990,7 @@ class SiriusContext : public ClientContextState {
   std::unordered_map<std::uint64_t, std::vector<std::size_t>> learned_peaks_;
   std::string querylog_path_;  // SIRIUS_QUERYLOG
   bool admit_runtime_{false};
+  bool admit_bestfit_{false};  // SIRIUS_ADMIT_BESTFIT: largest fitting waiter first
   std::size_t admit_device_margin_{0};
   bool admit_device_aware_{false};
   std::size_t admit_budget() const;  // caller holds query_lifecycle_mutex_

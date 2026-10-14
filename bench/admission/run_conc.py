@@ -65,6 +65,9 @@ def main():
     p.add_argument("--no-warm", action="store_true", help="cold: skip serial warm-up (no template seen before)")
     p.add_argument("--serial-ref", default=None, help="JSON of a warm run whose serial latencies define speedup")
     p.add_argument("--hog", default=None, help="co-tenant: delay_s,gib,hold_s after throughput phase starts")
+    p.add_argument("--admit-bestfit", action="store_true", help="largest fitting waiter first")
+    p.add_argument("--stagger-heavy", type=int, default=0, help="max concurrent heavy merge/sort tasks")
+    p.add_argument("--task-chain-history", type=int, default=0, help="cross-query chain history: 1 cold, 2 floor")
     p.add_argument("--querylog", action="store_true", help="per-query wait/run/projection/engine peak -> <out>.q.tsv")
     p.add_argument("--tasklog", action="store_true", help="per-task Sirius estimate vs actual to <out>.task.tsv")
     p.add_argument("--admit-structural-field", default=None, choices=["min", "fast"])
@@ -109,6 +112,9 @@ def main():
     if a.admit_runtime: os.environ["SIRIUS_ADMIT_RUNTIME"] = "1"
     if a.admit_aging_ms: os.environ["SIRIUS_ADMIT_AGING_MS"] = str(a.admit_aging_ms)
     if a.admit_device_margin_gb is not None: os.environ["SIRIUS_ADMIT_DEVICE_MARGIN_GB"] = str(a.admit_device_margin_gb)
+    if a.admit_bestfit: os.environ["SIRIUS_ADMIT_BESTFIT"] = "1"
+    if a.stagger_heavy: os.environ["SIRIUS_STAGGER_HEAVY"] = str(a.stagger_heavy)
+    if a.task_chain_history: os.environ["SIRIUS_TASK_CHAIN_HISTORY"] = str(a.task_chain_history)
     if a.querylog: os.environ["SIRIUS_QUERYLOG"] = os.path.abspath(a.out + ".q.tsv")
     if a.tasklog: os.environ["SIRIUS_TASKLOG"] = os.path.abspath(a.out + ".task.tsv")
     if a.admit_structural_field: os.environ["SIRIUS_ADMIT_STRUCTURAL_FIELD"] = a.admit_structural_field

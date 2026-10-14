@@ -30,6 +30,7 @@
 #include <thrust/system/system_error.h>
 
 #include "memory/query_memory_ledger.hpp"
+#include "pipeline/chain_memory_history.hpp"
 
 #include <absl/cleanup/cleanup.h>
 #include <cucascade/data/data_repository.hpp>
@@ -38,6 +39,7 @@
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <data/data_batch_utils.hpp>
 
+#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <cstdlib>
@@ -47,6 +49,27 @@
 #include <optional>
 #include <string>
 #include <unordered_set>
+
+
+namespace {
+// Operator-chain signature of a pipeline: the key for cross-query memory history.
+template <typename PipelinePtr>
+std::string chain_signature(PipelinePtr const& pipeline)
+{
+  std::string sig;
+  if (!pipeline) { return sig; }
+  if (auto src = pipeline->get_source()) { sig += src->get_name(); }
+  for (auto& op_ref : pipeline->get_operators()) {
+    sig += '>';
+    sig += op_ref.get().get_name();
+  }
+  if (auto sink = pipeline->get_sink()) {
+    sig += '>';
+    sig += sink->get_name();
+  }
+  return sig;
+}
+}  // namespace
 
 namespace sirius {
 namespace pipeline {
@@ -440,6 +463,10 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
                            ->input_basis;
       auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
       global.get_memory_history().record_on_failure(input_basis, peak_bytes);
+      if (chain_memory_history::mode() > 0) {
+        chain_memory_history::get(chain_signature(global.get_pipeline()))
+          .record_on_failure(input_basis, peak_bytes);
+      }
 
       throw oom_reschedule_exception(
         std::move(operator_input_output_data),
@@ -521,6 +548,31 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     std::format("Pipeline {} Task {} [{}]", pipeline->get_pipeline_id(), get_task_id(), op_chain);
   nvtx3::scoped_range nvtx_range{nvtx_label.c_str()};
 
+  // Stagger (experimental, SIRIUS_STAGGER_HEAVY=K): at most K tasks of heavy
+  // merge/sort chains run at once across all queries.
+  static int const stagger_k = [] {
+    auto const* v = std::getenv("SIRIUS_STAGGER_HEAVY");
+    return v ? std::atoi(v) : 0;
+  }();
+  static std::mutex stagger_mutex;
+  static std::condition_variable stagger_cv;
+  static int stagger_active = 0;
+  bool const heavy = stagger_k > 0 && (op_chain.find("MERGE_GROUP_BY") != std::string::npos ||
+                                       op_chain.find("ORDER_BY") != std::string::npos);
+  if (heavy) {
+    std::unique_lock<std::mutex> lock(stagger_mutex);
+    stagger_cv.wait(lock, [] { return stagger_active < stagger_k; });
+    ++stagger_active;
+  }
+  absl::Cleanup stagger_release = [heavy]() {
+    if (!heavy) { return; }
+    {
+      std::lock_guard<std::mutex> lock(stagger_mutex);
+      --stagger_active;
+    }
+    stagger_cv.notify_one();
+  };
+
   auto const prepare_start = std::chrono::high_resolution_clock::now();
   auto reservation         = local_state.release_reservation();
   if (!reservation) { throw std::runtime_error("GPU pipeline task requires a memory reservation"); }
@@ -582,6 +634,10 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     peak_bytes   = peak_bytes > bytes_to_materialize ? peak_bytes - bytes_to_materialize : 0;
     auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
     global.get_memory_history().record_on_failure(input_basis, peak_bytes);
+      if (chain_memory_history::mode() > 0) {
+        chain_memory_history::get(chain_signature(global.get_pipeline()))
+          .record_on_failure(input_basis, peak_bytes);
+      }
 
     SIRIUS_LOG_ERROR("Pipeline {}: OOM preparing batches for processing",
                      pipeline->get_pipeline_id());
@@ -654,6 +710,9 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     }
     auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
     global.get_memory_history().record({input_basis, peak_bytes, output_bytes});
+    if (chain_memory_history::mode() > 0) {
+      chain_memory_history::get(chain_signature(pipeline)).record({input_basis, peak_bytes, output_bytes});
+    }
     sirius::memory::query_memory_ledger::instance().add_held(ledger_query, output_bytes);
     // Experimental (env-gated): per-task estimate vs actual, for the admission study.
     static std::string const tasklog_path = [] {
@@ -726,6 +785,19 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
   std::size_t input_basis          = ls.get_task_consumption_basis();
   std::size_t bytes_to_materialize = ls.get_estimated_bytes_to_materialize_input(target_space);
   auto peak_opt                    = gs.get_memory_history().estimate_peak_memory(input_basis);
+  // Cross-query chain history (experimental): fill a cold pipeline's estimate,
+  // and in mode 2 floor the per-query estimate with it.
+  if (chain_memory_history::mode() > 0 && input_basis > 0) {
+    auto chain_opt =
+      chain_memory_history::get(chain_signature(gs.get_pipeline())).estimate_peak_memory(input_basis);
+    if (chain_opt.has_value()) {
+      if (!peak_opt.has_value()) {
+        peak_opt = chain_opt;
+      } else if (chain_memory_history::mode() >= 2) {
+        peak_opt = std::max(*peak_opt, *chain_opt);
+      }
+    }
+  }
   const auto input_type =
     ls._input_data ? ls._input_data->get_type() : op::operator_data_type::BASE;
   const bool input_resident = ls._input_data && ls._input_data->is_resident();

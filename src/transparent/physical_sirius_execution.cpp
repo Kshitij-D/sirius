@@ -224,6 +224,7 @@ struct walk_result {
   double work{0};   // need_min: working tasks only
   double held{0};   // bytes materialized for the parent
   double task{0};   // bytes of one task of the pipeline feeding the parent
+  double base{0};   // base-table bytes read by the subtree (caps join build sizes)
 };
 
 walk_result walk_peak(duckdb::LogicalOperator& op,
@@ -254,7 +255,7 @@ walk_result walk_peak(duckdb::LogicalOperator& op,
       double task       = chunk_rows * row_width(read_types);
       double tasks      = std::max(1.0, std::ceil(rows / std::max(1.0, chunk_rows)));
       double w          = 2 * task * std::min(threads, tasks);
-      return {w, w, 0, task};
+      return {w, w, 0, task, rows * row_width(read_types)};
     }
     case T::LOGICAL_COMPARISON_JOIN:
     case T::LOGICAL_DELIM_JOIN:
@@ -264,15 +265,22 @@ walk_result walk_peak(duckdb::LogicalOperator& op,
       if (op.children.size() != 2) { break; }
       auto build = walk_peak(*op.children[1], ctx, batch_bytes, threads);
       auto probe = walk_peak(*op.children[0], ctx, batch_bytes, threads);
-      double ht  = 2 * std::min(bytes_of(*op.children[1]), build.held > 0 ? build.held : bytes_of(*op.children[1]));
-      return {std::max(build.peak, ht + probe.peak), std::max(build.work, probe.work), probe.held, probe.task};
+      // DuckDB's join estimates inflate; a build side cannot hold more than its
+      // subtree read from base tables (FK joins), nor more than its materialized input.
+      double bb = bytes_of(*op.children[1]);
+      if (build.held > 0) { bb = std::min(bb, build.held); }
+      if (build.base > 0) { bb = std::min(bb, build.base); }
+      double ht = 2 * bb;
+      return {std::max(build.peak, ht + probe.peak), std::max(build.work, probe.work), probe.held,
+              probe.task, build.base + probe.base};
     }
     case T::LOGICAL_AGGREGATE_AND_GROUP_BY:
     case T::LOGICAL_WINDOW: {
       if (op.children.empty()) { break; }
       auto in      = walk_peak(*op.children[0], ctx, batch_bytes, threads);
       double state = std::min(bytes_of(op), threads * batch_bytes);
-      return {in.peak + 2 * state, in.work, state, in.task};
+      if (in.base > 0) { state = std::min(state, in.base); }
+      return {in.peak + 2 * state, in.work, state, in.task, in.base};
     }
     case T::LOGICAL_ORDER_BY:
     case T::LOGICAL_TOP_N: {
@@ -280,7 +288,8 @@ walk_result walk_peak(duckdb::LogicalOperator& op,
       auto in     = walk_peak(*op.children[0], ctx, batch_bytes, threads);
       double data = in.held > 0 ? in.held : bytes_of(*op.children[0]);
       if (op.type == T::LOGICAL_TOP_N) { data = std::min(data, threads * in.task); }
-      return {in.peak + 2 * data, in.work, data, in.task};
+      if (in.base > 0) { data = std::min(data, in.base); }
+      return {in.peak + 2 * data, in.work, data, in.task, in.base};
     }
     default: break;
   }
@@ -292,6 +301,7 @@ walk_result walk_peak(duckdb::LogicalOperator& op,
     r.peak = std::max(r.peak, held_before + c.peak);
     r.work = std::max(r.work, c.work);
     r.task = std::max(r.task, c.task);
+    r.base += c.base;
     held_before += c.held;
   }
   r.held = held_before;

@@ -1049,6 +1049,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   if (auto const* v = std::getenv("SIRIUS_QUERYLOG")) { querylog_path_ = v; }
   if (auto const* v = std::getenv("SIRIUS_ADMIT_RUNTIME")) { admit_runtime_ = std::string(v) == "1"; }
   if (auto const* v = std::getenv("SIRIUS_ADMIT_AGING_MS")) { admit_aging_ms_ = std::stoi(v); }
+  if (auto const* v = std::getenv("SIRIUS_ADMIT_BESTFIT")) { admit_bestfit_ = std::string(v) == "1"; }
   if (auto const* v = std::getenv("SIRIUS_ADMIT_DEVICE_MARGIN_GB")) {
     admit_device_aware_  = true;
     admit_device_margin_ = static_cast<std::size_t>(std::stod(v) * (1ULL << 30));
@@ -2286,7 +2287,18 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
             std::chrono::steady_clock::now() - oldest.since > std::chrono::milliseconds(admit_aging_ms_);
           if (starving && waiters_.begin()->first != my_waiter) { committed += oldest.projected; }
         }
-        return committed <= admit_budget();
+        auto const budget = admit_budget();
+        if (committed > budget) { return false; }
+        // Best-fit: if a larger waiter also fits right now, let it go first.
+        if (admit_bestfit_) {
+          auto const base = committed - projected;
+          for (auto const& [seq, w] : waiters_) {
+            if (seq != my_waiter && w.projected > projected && base + w.projected <= budget) {
+              return false;
+            }
+          }
+        }
+        return true;
       };
       ++query_lifecycle_waiting_;
       waiters_[my_waiter] = waiter{wait_start, projected};
