@@ -23,6 +23,8 @@
 #include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "io/s3/static_credentials.hpp"
 #include "io/uring/uring_ioctx.hpp"
+
+#include <cstdlib>
 #include "log/logging.hpp"
 #include "scan_manager/config.hpp"
 
@@ -173,7 +175,10 @@ io_context_registry::io_context_registry(
   config_type config, cucascade::memory::memory_reservation_manager& reservation_manager)
   : _config(std::move(config)),
     _reservation_manager(reservation_manager),
-    _prefer_kvikio_for_file_scheme(!_config.use_sirius_datasource)
+    // SIRIUS_FORCE_KVIKIO: route local files to kvikio even when use_sirius_datasource is on
+    // (test runs on kernels without io_uring; default behavior unchanged).
+    _prefer_kvikio_for_file_scheme(!_config.use_sirius_datasource ||
+                                   std::getenv("SIRIUS_FORCE_KVIKIO") != nullptr)
 {
   // uring / rest claim paths via their reactor's static supports() (local
   // files and s3:// URLs respectively).  kvikio is the universal fallback —

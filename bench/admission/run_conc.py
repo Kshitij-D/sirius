@@ -81,11 +81,24 @@ def main():
                    help="--demote auto: largest single-query GPU need the shrunk budget must still cover")
     p.add_argument("--shared-scan-mb", type=float, default=0, help="cooperative shared scan buffer (MB) for host-tier tables")
     p.add_argument("--memory-manager", action="store_true", help="SIRIUS_MEMORY_MANAGER=1: the unified manager, all layers")
+    p.add_argument("--arrival", default=None,
+                   help="open loop: poisson:RATE_QPS:N or burst:RATE_QPS:N:BURST (N queries, random templates)")
+    p.add_argument("--workers", type=int, default=64, help="open loop: client connections available")
+    p.add_argument("--benchmark", default="tpch", choices=["tpch", "tpcds"])
+    p.add_argument("--tpcds-queries-dir", default="/scratch/general/vast/u1652955/tpcds_queries")
     p.add_argument("--querylog", action="store_true", help="per-query wait/run/projection/engine peak -> <out>.q.tsv")
     p.add_argument("--tasklog", action="store_true", help="per-task Sirius estimate vs actual to <out>.task.tsv")
     p.add_argument("--admit-structural-field", default=None, choices=["min", "fast"])
     p.add_argument("--gpu-frac", type=float, default=0.90, help="Sirius GPU usage_limit_fraction")
     a = p.parse_args()
+    global QUERIES
+    if a.benchmark == "tpcds":
+        # Sirius's GPU-supported TPC-DS subset (test/tpcds_performance/run_tpcds_super_gpu.sh).
+        if a.queries == "1-22": a.queries = "3,7,22,26,32,37,42,52,55,62,82,85,92,93,97"
+        QUERIES = {}
+        for f in os.listdir(a.tpcds_queries_dir):
+            if f.startswith("q") and f.endswith(".sql"):
+                QUERIES[f[:-4]] = open(os.path.join(a.tpcds_queries_dir, f)).read()
     def parse(spec):
         out = set()
         for part in spec.split(","):
@@ -155,8 +168,14 @@ def main():
 
     R = dict(args=vars(a), max_conc=max_conc, marks={})
     con = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
-    for s in _build_views_sql(a.data).split(";"):
-        if s.strip(): con.execute(s)
+    if a.benchmark == "tpcds":
+        import glob as _glob
+        for f in sorted(_glob.glob(os.path.join(os.path.abspath(a.data), "*.parquet"))):
+            t = os.path.basename(f)[:-8]
+            con.execute(f"CREATE VIEW {t} AS SELECT * FROM read_parquet('{f}')")
+    else:
+        for s in _build_views_sql(a.data).split(";"):
+            if s.strip(): con.execute(s)
     t = now(); con.execute(f"LOAD '{EXT}'"); R["load_s"] = now() - t
     for s in a.pre_sql.split(";"):
         if s.strip(): con.execute(s).fetchall()
@@ -164,7 +183,14 @@ def main():
         t = now()
         from tpch_pin_columns import union_columns_by_table, _pin_call
         pin_marks = []
-        for tbl, cols in union_columns_by_table().items():
+        if a.benchmark == "tpcds":
+            import re as _re
+            views = [r[0] for r in con.execute("SELECT table_name FROM duckdb_views() WHERE NOT internal").fetchall()]
+            used = [t for t in views if any(_re.search(rf"\b{t}\b", QUERIES.get(f"q{q}", "")) for q in qset)]
+            pin_tables = {t: [r[0] for r in con.execute(f"DESCRIBE {t}").fetchall()] for t in used}
+        else:
+            pin_tables = union_columns_by_table()
+        for tbl, cols in pin_tables.items():
             tb = now()
             for st in _pin_call(tbl, cols, a.data, "parquet").split(";"):
                 if st.strip(): con.execute(st).fetchall()
@@ -201,11 +227,16 @@ def main():
             if s.strip(): c.execute(s).fetchall()
     barrier = threading.Barrier(a.clients + 1)
     log, errors = [], []
+    def client_order(seed):
+        if a.benchmark == "tpcds":
+            import random as _r
+            o = sorted(qset); _r.Random(seed).shuffle(o); return o
+        return stream_order(seed)
     def client(i):
         c = curs[i]; barrier.wait()
         order = []
         for r in range(a.rounds):
-            so = stream_order(1 + i + r * a.clients)
+            so = client_order(1 + i + r * a.clients)
             if phase_sets:
                 continue
             mine = client_sets[i] if client_sets else qset
@@ -213,14 +244,60 @@ def main():
         if phase_sets:
             for ps in phase_sets:
                 for r in range(a.rounds):
-                    order += [q for q in stream_order(1 + i + r * a.clients) if q in ps]
+                    order += [q for q in client_order(1 + i + r * a.clients) if q in ps]
         for q in order:
             if True:
                 t0 = now()
                 try: c.execute(QUERIES[f"q{q}"]).fetchall()
                 except Exception as e: errors.append((i, q, repr(e)[:300]))
                 log.append((i, q, t0, now()))
-    th = [threading.Thread(target=client, args=(i,)) for i in range(a.clients)]
+    if a.arrival:
+        # Open loop: arrivals follow a schedule independent of completions; latency is
+        # completion minus ARRIVAL, so any queueing (client pool or engine admission) counts.
+        import queue, random as _rnd
+        kind, *ps = a.arrival.split(":")
+        rate, nq = float(ps[0]), int(ps[1])
+        rng = _rnd.Random(42)
+        templates = sorted(qset)
+        sched, t = [], 0.0
+        if kind == "poisson":
+            for _ in range(nq):
+                t += rng.expovariate(rate); sched.append((t, rng.choice(templates)))
+        else:  # burst: groups of BURST simultaneous arrivals at the same mean rate
+            burst = int(ps[2])
+            while len(sched) < nq:
+                t += rng.expovariate(rate / burst)
+                for _ in range(min(burst, nq - len(sched))): sched.append((t, rng.choice(templates)))
+        R["arrival"] = dict(kind=kind, rate=rate, n=nq, workers=a.workers)
+        work = queue.Queue()
+        extra = [con.cursor() for _ in range(max(0, a.workers - len(curs)))]
+        for c in extra:
+            for st in a.pre_sql.split(";"):
+                if st.strip(): c.execute(st).fetchall()
+        pool = curs + extra
+        def worker(i):
+            c = pool[i]; barrier.wait()
+            while True:
+                item = work.get()
+                if item is None: return
+                q, t_arr = item
+                try: c.execute(QUERIES[f"q{q}"]).fetchall()
+                except Exception as e: errors.append((i, q, repr(e)[:300]))
+                log.append((i, q, t_arr, now()))
+        def dispatcher():
+            barrier.wait()
+            t_base = now()
+            for t_rel, q in sched:
+                d = t_base + t_rel - now()
+                if d > 0: time.sleep(d)
+                work.put((q, t_base + t_rel))
+            for _ in range(a.workers): work.put(None)
+        th = [threading.Thread(target=worker, args=(i,)) for i in range(a.workers)]
+        barrier = threading.Barrier(a.workers + 2)  # workers + dispatcher + main
+        th.append(threading.Thread(target=dispatcher))
+        a.clients = a.workers
+    else:
+        th = [threading.Thread(target=client, args=(i,)) for i in range(a.clients)]
     for x in th: x.start()
     ru0 = resource.getrusage(resource.RUSAGE_SELF); barrier.wait(); t0 = now()
     if a.cotenant:
