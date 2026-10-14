@@ -188,7 +188,7 @@ def main():
         pin_marks = []
         if a.benchmark == "tpcds":
             import re as _re
-            views = [r[0] for r in con.execute("SELECT table_name FROM duckdb_views() WHERE NOT internal").fetchall()]
+            views = [r[0] for r in con.execute("SELECT view_name FROM duckdb_views() WHERE NOT internal").fetchall()]
             used = [t for t in views if any(_re.search(rf"\b{t}\b", QUERIES.get(f"q{q}", "")) for q in qset)]
             pin_tables = {t: [r[0] for r in con.execute(f"DESCRIBE {t}").fetchall()] for t in used}
         else:
