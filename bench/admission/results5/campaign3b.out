@@ -1,0 +1,37 @@
+mixed__ours2__r1: clients=16 makespan=24.61s qps=18.20 speedup_vs_serial=2.05 inflight=14.51 cpu_cores=7.37 errors=0 fallbacks=0 oom_retries=0 plan_fallbacks=0
+warm_full__ours2_bf__r1: clients=16 makespan=26.76s qps=13.15 speedup_vs_serial=1.77 inflight=15.11 cpu_cores=7.19 errors=0 fallbacks=0 oom_retries=0 plan_fallbacks=0
+warm_full__cap4__r1: exists
+warm_full__plan__r1: clients=16 makespan=25.15s qps=13.99 speedup_vs_serial=1.88 inflight=14.21 cpu_cores=7.74 errors=0 fallbacks=0 oom_retries=0 plan_fallbacks=0
+cold_f75__plan__r1: clients=16 makespan=35.20s qps=10.00 speedup_vs_serial=1.34 inflight=13.33 cpu_cores=6.62 errors=0 fallbacks=0 oom_retries=36 plan_fallbacks=0
+mixed__ours2_bf__r1: clients=16 makespan=23.91s qps=18.73 speedup_vs_serial=2.11 inflight=13.99 cpu_cores=7.56 errors=0 fallbacks=0 oom_retries=0 plan_fallbacks=0
+warm_f75__ours2_age500__r1: Error in Sirius GPU execution, fallback to DuckDB clients=16 makespan=40.80s qps=8.63 speedup_vs_serial=1.16 inflight=14.49 cpu_cores=5.84 errors=0 fallbacks=0 oom_retries=0 plan_fallbacks=0
+shift_f75__ours2_bf__r1: Error in Sirius GPU execution, fallback to DuckDB clients=16 makespan=40.51s qps=8.69 speedup_vs_serial=1.17 inflight=12.56 cpu_cores=5.72 errors=0 fallbacks=0 oom_retries=0 plan_fallbacks=0
+warm_f75__ours2__r1: Error in Sirius GPU execution, fallback to DuckDB clients=16 makespan=39.30s qps=8.96 speedup_vs_serial=1.20 inflight=14.24 cpu_cores=5.94 errors=0 fallbacks=0 oom_retries=0 plan_fallbacks=0
+cold_f75__ours2_bf__r1: clients=16 makespan=40.95s qps=8.60 speedup_vs_serial=1.15 inflight=14.33 cpu_cores=5.85 errors=0 fallbacks=0 oom_retries=2 plan_fallbacks=0
+broker_host__concurrent__r1: mode=concurrent->concurrent pin=host qps=5.61 p50=2879ms p95=2946ms p99=2948ms mean_batch=1.0 fused_correct=True
+broker_host__broker__r1: mode=broker->broker pin=host qps=21.17 p50=699ms p95=895ms p99=895ms mean_batch=12.8 fused_correct=True
+cold_f75__plan_chain3__r1: exists
+broker_gpu__broker__r1: mode=broker->broker pin=gpu qps=24.43 p50=657ms p95=707ms p99=707ms mean_batch=8.0 fused_correct=True
+shift_f75__cap4__r1: Error in Sirius GPU execution, fallback to DuckDB clients=16 makespan=90.84s qps=3.87 speedup_vs_serial=0.52 inflight=14.53 cpu_cores=5.66 errors=0 fallbacks=1 oom_retries=40 plan_fallbacks=0
+shift_f75__plan__r1: clients=16 makespan=35.49s qps=9.92 speedup_vs_serial=1.33 inflight=12.11 cpu_cores=6.35 errors=0 fallbacks=0 oom_retries=52 plan_fallbacks=0
+warm_full__ours2_age500__r1: clients=16 makespan=26.11s qps=13.48 speedup_vs_serial=1.81 inflight=15.37 cpu_cores=7.34 errors=0 fallbacks=0 oom_retries=0 plan_fallbacks=0
+mixed__plan_chain3__r1: clients=16 makespan=22.78s qps=19.67 speedup_vs_serial=2.21 inflight=13.96 cpu_cores=8.02 errors=0 fallbacks=0 oom_retries=0 plan_fallbacks=0
+warm_f75__cap4__r1: clients=16 makespan=42.87s qps=8.21 speedup_vs_serial=1.10 inflight=15.58 cpu_cores=6.46 errors=0 fallbacks=0 oom_retries=40 plan_fallbacks=0
+warm_full__plan_chain3__r1: clients=16 makespan=24.78s qps=14.20 speedup_vs_serial=1.91 inflight=14.88 cpu_cores=7.82 errors=0 fallbacks=0 oom_retries=0 plan_fallbacks=0
+warm_f75__ours2_age1000__r1: Error in Sirius GPU execution, fallback to DuckDB clients=16 makespan=40.70s qps=8.65 speedup_vs_serial=1.16 inflight=14.21 cpu_cores=5.85 errors=0 fallbacks=0 oom_retries=0 plan_fallbacks=0
+warm_f75__plan_chain3__r1: Error in Sirius GPU execution, fallback to DuckDB clients=16 makespan=34.48s qps=10.21 speedup_vs_serial=1.37 inflight=13.47 cpu_cores=6.50 errors=0 fallbacks=0 oom_retries=0 plan_fallbacks=0
+shift_f75__plan_chain3__r1: exists
+broker_gpu__concurrent__r1: mode=concurrent->concurrent pin=gpu qps=73.32 p50=231ms p95=266ms p99=266ms mean_batch=1.0 fused_correct=True
+warm_f75__ours2_age4000__r1: exists
+warm_f75__plan__r1: clients=16 makespan=34.43s qps=10.22 speedup_vs_serial=1.37 inflight=13.41 cpu_cores=6.53 errors=0 fallbacks=0 oom_retries=30 plan_fallbacks=0
+warm_full__ours2_age4000__r1: clients=16 makespan=26.22s qps=13.43 speedup_vs_serial=1.80 inflight=14.40 cpu_cores=7.33 errors=0 fallbacks=0 oom_retries=0 plan_fallbacks=0
+cold_f75__ours2__r1: clients=16 makespan=40.09s qps=8.78 speedup_vs_serial=1.18 inflight=14.44 cpu_cores=5.90 errors=0 fallbacks=0 oom_retries=2 plan_fallbacks=0
+warm_full__ours2_age1000__r1: clients=16 makespan=26.47s qps=13.30 speedup_vs_serial=1.79 inflight=15.48 cpu_cores=7.22 errors=0 fallbacks=0 oom_retries=0 plan_fallbacks=0
+cold_f75__cap4__r1: clients=16 makespan=32.88s qps=10.71 speedup_vs_serial=1.44 inflight=15.25 cpu_cores=7.43 errors=0 fallbacks=0 oom_retries=34 plan_fallbacks=0
+mixed__cap4__r1: clients=16 makespan=24.66s qps=18.17 speedup_vs_serial=2.04 inflight=13.73 cpu_cores=7.37 errors=0 fallbacks=0 oom_retries=0 plan_fallbacks=0
+warm_full__ours2__r1: exists
+shift_f75__ours2__r1: Error in Sirius GPU execution, fallback to DuckDB clients=16 makespan=38.06s qps=9.25 speedup_vs_serial=1.24 inflight=13.73 cpu_cores=6.07 errors=0 fallbacks=0 oom_retries=0 plan_fallbacks=0
+mixed__plan__r1: clients=16 makespan=22.30s qps=20.09 speedup_vs_serial=2.26 inflight=13.70 cpu_cores=7.93 errors=0 fallbacks=0 oom_retries=0 plan_fallbacks=0
+warm_f75__ours2_bf__r1: Error in Sirius GPU execution, fallback to DuckDB clients=16 makespan=41.40s qps=8.50 speedup_vs_serial=1.14 inflight=13.97 cpu_cores=5.78 errors=0 fallbacks=0 oom_retries=0 plan_fallbacks=0
+REPEAT_DONE 1
+CAMPAIGN3DONE
