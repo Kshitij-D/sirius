@@ -36,7 +36,8 @@ namespace sirius::pipeline {
  * a new query's first task can use what the engine observed before.
  *
  * Mode (SIRIUS_TASK_CHAIN_HISTORY): 0 off, 1 used when the pipeline has no
- * history yet, 2 also a floor under the per-query history estimate.
+ * history yet, 2 also a floor under the per-query history estimate, 3 like 2
+ * but the chain estimate is the max ratio among similar-size records.
  */
 class chain_memory_history {
  public:

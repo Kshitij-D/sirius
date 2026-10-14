@@ -788,8 +788,9 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
   // Cross-query chain history (experimental): fill a cold pipeline's estimate,
   // and in mode 2 floor the per-query estimate with it.
   if (chain_memory_history::mode() > 0 && input_basis > 0) {
-    auto chain_opt =
-      chain_memory_history::get(chain_signature(gs.get_pipeline())).estimate_peak_memory(input_basis);
+    auto& chain_hist = chain_memory_history::get(chain_signature(gs.get_pipeline()));
+    auto chain_opt   = chain_memory_history::mode() >= 3 ? chain_hist.estimate_peak_memory_max(input_basis)
+                                                         : chain_hist.estimate_peak_memory(input_basis);
     if (chain_opt.has_value()) {
       if (!peak_opt.has_value()) {
         peak_opt = chain_opt;

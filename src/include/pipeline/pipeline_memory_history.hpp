@@ -115,6 +115,27 @@ class pipeline_memory_history {
    * @param estimated_bytes The estimation basis for the new task.
    * @return The estimated peak memory in bytes, or nullopt if no history exists.
    */
+  /// Conservative variant (experimental): the largest peak/input ratio among
+  /// records with a similar input size (within 2x); falls back to the
+  /// weighted estimate when none is similar.
+  [[nodiscard]] std::optional<std::size_t> estimate_peak_memory_max(std::size_t estimated_bytes) const
+  {
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      if (_records.empty() || estimated_bytes == 0) { return std::nullopt; }
+      double best = -1.0;
+      for (const auto& rec : _records) {
+        double size_ratio =
+          static_cast<double>(rec.estimated_bytes) / static_cast<double>(estimated_bytes);
+        if (size_ratio < 0.5 || size_ratio > 2.0) { continue; }
+        best = std::max(best,
+                        static_cast<double>(rec.peak_memory_bytes) / static_cast<double>(rec.estimated_bytes));
+      }
+      if (best >= 0) { return static_cast<std::size_t>(best * static_cast<double>(estimated_bytes)); }
+    }
+    return estimate_peak_memory(estimated_bytes);
+  }
+
   [[nodiscard]] std::optional<std::size_t> estimate_peak_memory(std::size_t estimated_bytes) const
   {
     std::lock_guard<std::mutex> lock(_mutex);
