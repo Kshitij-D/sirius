@@ -28,6 +28,7 @@
 #include "op/scan/gpu_ingestible.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
+#include "scan_manager/sirius_scan_manager.hpp"
 
 #include <cudf/reduction.hpp>
 #include <cudf/reduction/unique_count.hpp>
@@ -883,6 +884,129 @@ device_pin_result materialize_all_batches_compressed(
     });
 
   return out;
+}
+
+namespace {
+// Clone a pinned entry's zone maps into the capture shape the insert APIs take
+// (chunk-major: stats[chunk][column]); empty when the entry has none.
+void clone_zone_maps(scan_manager::pinned_entry const& e,
+                     std::size_t n_chunks,
+                     duckdb::vector<duckdb::LogicalType>& types,
+                     std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>>& stats)
+{
+  if (!e.zone_maps.has_stats()) { return; }
+  auto const n_cols = e.zone_maps.column_count();
+  for (std::size_t i = 0; i < n_cols; ++i) {
+    types.push_back(e.zone_maps.column_type(i));
+  }
+  stats.resize(n_chunks);
+  for (std::size_t c = 0; c < n_chunks; ++c) {
+    for (std::size_t i = 0; i < n_cols; ++i) {
+      auto const* cell = e.zone_maps.cell(i, c);
+      if (cell == nullptr) {
+        types.clear();
+        stats.clear();
+        return;
+      }
+      stats[c].push_back(duckdb::make_uniq<duckdb::BaseStatistics>(cell->Copy()));
+    }
+  }
+}
+}  // namespace
+
+std::size_t demote_pinned_table_to_host(scan_manager::sirius_scan_manager& scan_mgr,
+                                        const std::string& name,
+                                        cucascade::memory::memory_space& host_space)
+{
+  auto old = scan_mgr.get_pinned_entry(name);
+  if (!old || old->tier != cucascade::memory::Tier::GPU || old->data_batches_by_column.empty()) {
+    return 0;
+  }
+  auto const names     = old->cache_info.column_names();
+  auto const n_chunks  = old->chunk_memory_spaces.size();
+  auto& registry       = converter_registry::get();
+  rmm::cuda_stream stream;
+  std::vector<std::shared_ptr<cucascade::idata_representation>> host_chunks;
+  host_chunks.reserve(n_chunks);
+  std::size_t moved = 0;
+  for (std::size_t c = 0; c < n_chunks; ++c) {
+    std::vector<std::shared_ptr<cudf::column>> owner;
+    std::vector<cudf::column_view> views;
+    std::size_t bytes = 0;
+    for (auto const& col_name : names) {
+      auto const& col = old->data_batches_by_column.at(col_name).at(c);
+      owner.push_back(col);
+      views.push_back(col->view());
+      bytes += col->alloc_size();
+    }
+    auto* src_space = old->chunk_memory_spaces[c];
+    cucascade::gpu_table_representation gpu_repr(
+      cudf::table_view(views), std::move(owner), bytes, *src_space, stream.view());
+    auto res = host_space.make_reservation_or_null(bytes);
+    auto host_repr = res != nullptr
+                       ? registry.convert<cucascade::host_data_representation>(gpu_repr, *res, stream.view())
+                       : registry.convert<cucascade::host_data_representation>(gpu_repr, &host_space, stream.view());
+    stream.synchronize();
+    host_chunks.push_back(std::move(host_repr));
+    moved += bytes;
+  }
+  duckdb::vector<duckdb::LogicalType> types;
+  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> stats;
+  clone_zone_maps(*old, n_chunks, types, stats);
+  scan_mgr.insert_pinned_entry_host(name,
+                                    old->cache_info,
+                                    std::move(host_chunks),
+                                    host_space,
+                                    std::move(types),
+                                    std::move(stats),
+                                    old->column_storage,
+                                    old->unique_columns);
+  return moved;
+}
+
+std::size_t promote_pinned_table_to_gpu(scan_manager::sirius_scan_manager& scan_mgr,
+                                        const std::string& name,
+                                        cucascade::memory::memory_space& gpu_space)
+{
+  auto old = scan_mgr.get_pinned_entry(name);
+  if (!old || old->tier != cucascade::memory::Tier::HOST || old->host_chunks.empty()) { return 0; }
+  auto& registry = converter_registry::get();
+  rmm::cuda_stream stream;
+  std::vector<std::unique_ptr<cudf::table>> tables;
+  std::vector<cucascade::memory::memory_space*> spaces;
+  std::size_t moved = 0;
+  for (auto const& chunk : old->host_chunks) {
+    // The converter API takes a mutable source; conversion only reads it (as the cached
+    // serve path does), and the old entry stays immutable to its readers.
+    auto* host = dynamic_cast<cucascade::host_data_representation*>(
+      const_cast<cucascade::idata_representation*>(chunk.get()));
+    if (host == nullptr) { return 0; }  // compressed host chunks: not supported here
+    auto bytes = host->get_size_in_bytes();
+    auto res   = gpu_space.make_reservation_or_null(bytes);
+    auto gpu_repr = res != nullptr
+                      ? registry.convert<cucascade::gpu_table_representation>(*host, *res, stream.view())
+                      : registry.convert<cucascade::gpu_table_representation>(*host, &gpu_space, stream.view());
+    tables.push_back(gpu_repr->release_table(stream.view()));
+    spaces.push_back(&gpu_space);
+    moved += bytes;
+  }
+  stream.synchronize();
+  duckdb::vector<duckdb::LogicalType> types;
+  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> stats;
+  clone_zone_maps(*old, tables.size(), types, stats);
+  // The GPU insert path refuses to replace an entry a query is reading; an unpin is safe
+  // mid-query (readers keep their reference), so remove first. Scans that start in the
+  // brief gap fall back to the uncached path.
+  scan_mgr.remove_pinned_entry(name);
+  scan_mgr.insert_pinned_entry(name,
+                               old->cache_info,
+                               std::move(tables),
+                               std::move(spaces),
+                               std::move(types),
+                               std::move(stats),
+                               old->column_storage,
+                               old->unique_columns);
+  return moved;
 }
 
 }  // namespace sirius

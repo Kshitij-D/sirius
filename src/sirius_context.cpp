@@ -66,6 +66,7 @@
 #include <algorithm>
 #include <cctype>
 #include "memory/query_memory_ledger.hpp"
+#include "pin_table.hpp"
 #include <chrono>
 #include <cstddef>
 #include <cstdio>   // for fprintf/fileno (fallback banner)
@@ -2557,11 +2558,55 @@ void SiriusContext::stop_memlog() noexcept
 
 void SiriusContext::start_budget_watcher_if_requested()
 {
-  auto const* path = std::getenv("SIRIUS_BUDGET_FILE");
-  if (path == nullptr || *path == '\0') { return; }
-  budget_thread_ = std::thread([this, file = std::string(path)] {
-    double last_gb = -1;
+  auto const* bpath = std::getenv("SIRIUS_BUDGET_FILE");
+  auto const* ppath = std::getenv("SIRIUS_PLACEMENT_FILE");
+  bool const has_budget    = bpath != nullptr && *bpath != '\0';
+  bool const has_placement = ppath != nullptr && *ppath != '\0';
+  if (!has_budget && !has_placement) { return; }
+  budget_thread_ = std::thread([this,
+                                file      = std::string(has_budget ? bpath : ""),
+                                placement = std::string(has_placement ? ppath : "")] {
+    double last_gb            = -1;
+    std::size_t placement_done = 0;  // lines of the placement file already executed
     while (!memlog_stop_.load(std::memory_order_relaxed)) {
+      // Placement commands (experimental): "demote <table>" / "promote <table>", one per line,
+      // appended over time; each new line runs once.
+      if (!placement.empty()) {
+        if (std::FILE* pf = std::fopen(placement.c_str(), "r")) {
+          char buf[512];
+          std::size_t line_no = 0;
+          while (std::fgets(buf, sizeof(buf), pf) != nullptr) {
+            if (++line_no <= placement_done) { continue; }
+            char verb[32] = {0}, table[256] = {0};
+            if (std::sscanf(buf, "%31s %255s", verb, table) == 2) {
+              auto const t0 = std::chrono::steady_clock::now();
+              std::size_t moved = 0;
+              try {
+                auto host_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+                auto gpu_spaces  = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+                if (std::string(verb) == "demote" && !host_spaces.empty()) {
+                  moved = sirius::demote_pinned_table_to_host(
+                    get_scan_manager(), table, *const_cast<cucascade::memory::memory_space*>(host_spaces[0]));
+                } else if (std::string(verb) == "promote" && !gpu_spaces.empty()) {
+                  moved = sirius::promote_pinned_table_to_gpu(
+                    get_scan_manager(), table, *const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]));
+                }
+              } catch (std::exception const& e) {
+                SIRIUS_LOG_WARN("SiriusContext: placement '{} {}' failed: {}", verb, table, e.what());
+              }
+              double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+              SIRIUS_LOG_INFO("SiriusContext: placement {} {}: moved {:.2f} GB in {:.0f} ms",
+                              verb, table, static_cast<double>(moved) / (1ULL << 30), ms);
+            }
+            placement_done = line_no;
+          }
+          std::fclose(pf);
+        }
+      }
+      if (file.empty()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        continue;
+      }
       if (std::FILE* f = std::fopen(file.c_str(), "r")) {
         double gb = -1;
         if (std::fscanf(f, "%lf", &gb) == 1 && gb > 0 && gb != last_gb) {

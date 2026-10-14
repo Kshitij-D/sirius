@@ -293,4 +293,26 @@ device_pin_result materialize_all_batches_compressed(
   compression_pin_config const& compression,
   pin_materialization_options options = {});
 
+namespace scan_manager {
+class sirius_scan_manager;
+}  // namespace scan_manager
+
+/// \brief Move a GPU-tier pinned table to the host tier in place (experimental).
+///
+/// Streams each pinned chunk device -> NUMA-local pinned host memory through the same
+/// converter the host-tier pin path uses (no extra GPU copy: the chunk is wrapped as a
+/// view of the pinned columns), carries over cache identity, zone maps and stored-column
+/// metadata, and swaps the entry atomically. Queries already serving the GPU entry keep
+/// their reference until they finish; the GPU memory is released after that.
+/// Supports the uncompressed GPU pin layout. Returns the bytes moved (0 if not applicable).
+std::size_t demote_pinned_table_to_host(scan_manager::sirius_scan_manager& scan_mgr,
+                                        const std::string& name,
+                                        cucascade::memory::memory_space& host_space);
+
+/// \brief Move a host-tier pinned table back to the GPU tier in place (experimental).
+/// Inverse of @ref demote_pinned_table_to_host. Returns the bytes moved (0 if not applicable).
+std::size_t promote_pinned_table_to_gpu(scan_manager::sirius_scan_manager& scan_mgr,
+                                        const std::string& name,
+                                        cucascade::memory::memory_space& gpu_space);
+
 }  // namespace sirius

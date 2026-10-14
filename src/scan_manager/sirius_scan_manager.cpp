@@ -1929,6 +1929,13 @@ std::size_t pinned_host_chunk_rows(cucascade::idata_representation const& chunk)
 
 }  // namespace
 
+std::shared_ptr<const pinned_entry> sirius_scan_manager::get_pinned_entry(const std::string& name) const
+{
+  std::lock_guard pin_lk{_pinned_entries_mutex};
+  auto it = _pinned_entries.find(name);
+  return it == _pinned_entries.end() ? nullptr : it->second;
+}
+
 void sirius_scan_manager::insert_pinned_entry_host(
   const std::string& name,
   cache_entry_info cache_info,
