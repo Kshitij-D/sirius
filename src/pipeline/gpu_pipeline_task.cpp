@@ -31,6 +31,7 @@
 
 #include "memory/query_memory_ledger.hpp"
 #include "pipeline/chain_memory_history.hpp"
+#include "scan_manager/shared_scan_cache.hpp"
 
 #include <absl/cleanup/cleanup.h>
 #include <cucascade/data/data_repository.hpp>
@@ -683,6 +684,11 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   // 3. Execute cudf operators on the pipeline
   _allocator       = allocator;
   auto input_basis = local_state.get_reservation_size_info()->input_basis;
+  // Evaluation counter: bytes this task moves into GPU memory to materialize its input
+  // (host/disk tier upgrades), i.e. the per-query PCIe traffic sharing avoids.
+  if (auto const mat = local_state.get_reservation_size_info()->bytes_to_materialize_input; mat > 0) {
+    sirius::scan_manager::shared_scan_cache::instance().add_copied(mat);
+  }
   // Ledger: a non-scan input is a previously published intermediate; this task consumes it.
   if (local_state._input_data &&
       local_state._input_data->get_type() != op::operator_data_type::GPU_SCAN) {

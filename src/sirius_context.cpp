@@ -2346,7 +2346,16 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
       };
       ++query_lifecycle_waiting_;
       waiters_[my_waiter] = waiter{wait_start, projected};
-      while (!can_admit()) {
+      auto timed_can_admit = [&] {
+        auto const t0 = std::chrono::steady_clock::now();
+        bool const ok = can_admit();
+        admit_decide_ns_.fetch_add(static_cast<std::uint64_t>(
+                                     std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - t0).count()),
+                                   std::memory_order_relaxed);
+        return ok;
+      };
+      while (!timed_can_admit()) {
         query_lifecycle_cv_.wait_for(lock, std::chrono::milliseconds(2));
       }
       waiters_.erase(my_waiter);
@@ -2662,7 +2671,8 @@ void SiriusContext::start_memlog_if_requested()
   memlog_thread_ = std::thread([this, file = std::string(path)] {
     std::FILE* f = std::fopen(file.c_str(), "w");
     if (f == nullptr) { return; }
-    std::fprintf(f, "t,gpu_alloc,gpu_reserved,gpu_avail,host_reserved,live,waiting,budget\n");
+    std::fprintf(f, "t,gpu_alloc,gpu_reserved,gpu_avail,host_reserved,live,waiting,budget,"
+                    "h2d_copied,h2d_reused,share_hits,share_misses,admit_decide_ns\n");
     using namespace std::chrono;
     while (!memlog_stop_.load(std::memory_order_relaxed)) {
       double t = duration<double>(system_clock::now().time_since_epoch()).count();
@@ -2681,7 +2691,7 @@ void SiriusContext::start_memlog_if_requested()
         waiting = query_lifecycle_waiting_;
       }
       std::fprintf(f,
-                   "%.4f,%zu,%zu,%zu,%zu,%d,%d,%zu\n",
+                   "%.4f,%zu,%zu,%zu,%zu,%d,%d,%zu,%zu,%zu,%zu,%zu,%llu\n",
                    t,
                    gpu_allocated_bytes(),
                    gres,
@@ -2689,7 +2699,12 @@ void SiriusContext::start_memlog_if_requested()
                    memory_manager_->get_total_reserved_memory_for_tier(cucascade::memory::Tier::HOST),
                    live,
                    waiting,
-                   current_budget_bytes_.load());
+                   current_budget_bytes_.load(),
+                   sirius::scan_manager::shared_scan_cache::instance().copied_bytes(),
+                   sirius::scan_manager::shared_scan_cache::instance().reused_bytes(),
+                   sirius::scan_manager::shared_scan_cache::instance().hits(),
+                   sirius::scan_manager::shared_scan_cache::instance().misses(),
+                   static_cast<unsigned long long>(admit_decide_ns_.load()));
       std::fflush(f);
       std::this_thread::sleep_for(milliseconds(10));
     }

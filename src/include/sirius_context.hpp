@@ -991,6 +991,7 @@ class SiriusContext : public ClientContextState {
   std::unordered_map<std::uint64_t, std::vector<std::size_t>> learned_peaks_;
   std::string querylog_path_;  // SIRIUS_QUERYLOG
   bool admit_runtime_{false};
+  std::atomic<std::uint64_t> admit_decide_ns_{0};  // total time spent evaluating admission
   // Unified memory manager (SIRIUS_MEMORY_MANAGER=1): all layers on, settings derived
   // from engine state; auto demotion/promotion of pinned tables on budget changes.
   bool memory_manager_mode_{false};

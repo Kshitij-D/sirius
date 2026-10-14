@@ -114,6 +114,13 @@ class shared_scan_cache {
   [[nodiscard]] std::size_t hits() const noexcept { return _hits.load(); }
   [[nodiscard]] std::size_t misses() const noexcept { return _misses.load(); }
 
+  // Byte counters for the evaluation: host->GPU bytes copied by scans (shared path and the
+  // regular per-query materialization) and bytes served from shared GPU copies instead.
+  void add_copied(std::size_t b) noexcept { _copied.fetch_add(b, std::memory_order_relaxed); }
+  void add_reused(std::size_t b) noexcept { _reused.fetch_add(b, std::memory_order_relaxed); }
+  [[nodiscard]] std::size_t copied_bytes() const noexcept { return _copied.load(); }
+  [[nodiscard]] std::size_t reused_bytes() const noexcept { return _reused.load(); }
+
  private:
   shared_scan_cache()
   {
@@ -142,6 +149,8 @@ class shared_scan_cache {
   std::unordered_map<std::string, std::size_t> _position;
   std::atomic<std::size_t> _hits{0};
   std::atomic<std::size_t> _misses{0};
+  std::atomic<std::size_t> _copied{0};
+  std::atomic<std::size_t> _reused{0};
 };
 
 }  // namespace sirius::scan_manager

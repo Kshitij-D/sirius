@@ -416,6 +416,8 @@ struct cached_databatch_provider : public databatch_provider {
       if (!columns[k]) {
         missing_pos.push_back(k);
         missing_idx.push_back(_column_indices[k]);
+      } else {
+        cache.add_reused(columns[k]->alloc_size());
       }
     }
     if (!missing_idx.empty()) {
@@ -428,6 +430,7 @@ struct cached_databatch_provider : public databatch_provider {
       auto released = table->release();
       for (std::size_t j = 0; j < released.size(); ++j) {
         std::shared_ptr<cudf::column> col(std::move(released[j]));
+        cache.add_copied(col->alloc_size());
         columns[missing_pos[j]] = cache.put(_share_key, index, missing_idx[j], std::move(col));
       }
     }
