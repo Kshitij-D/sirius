@@ -378,6 +378,11 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
                 static_cast<double>(std::max(1, cfg.get_gpu_pipeline_executor_config().num_threads)));
               features.need_fast = w.peak;
               features.need_min  = w.work;
+              features.need_task = walk_peak(*logical_plan_,
+                                             context.client,
+                                             static_cast<double>(cfg.get_operator_params().scan_task_batch_size),
+                                             1.0)
+                                     .work;
             }
             features.valid = true;
             duckdb::SiriusContext::set_pending_plan_features(features);

@@ -251,6 +251,7 @@ struct plan_footprint_features {
   // batches alone, i.e. with all state downgraded (need_min).
   double need_fast{0};
   double need_min{0};
+  double need_task{0};  // one task of the largest pipeline (one thread): unseen-query minimum grant
   bool valid{false};
 };
 
@@ -1009,9 +1010,35 @@ class SiriusContext : public ClientContextState {
   std::size_t admit_budget() const;  // caller holds query_lifecycle_mutex_
   int admit_aging_ms_{0};
   struct live_window {
-    std::size_t projected{0};
+    std::size_t projected{0};  // charged need (minimum grant in grant mode)
     std::uint32_t query_id{0};
   };
+  // Grant manager (SIRIUS_GRANT_MANAGER=1): data grants (resident tables), work grants
+  // [min, max] per query, shared grants (shared-scan copies); invariant
+  //   resident + shared + sum(max(min_q, held_q)) <= budget
+  // with the elastic remainder arbitrated by task reservations (+ chain history).
+  bool grant_mode_{false};
+  // Adaptive concurrency (grant mode): memory grants decide what is safe; this decides what is
+  // fast. Hill-climb the multiprogramming level on measured completion throughput.
+  bool adaptive_mpl_{false};
+  bool mpl_fixed_{false};  // SIRIUS_MPL_FIXED=P: limit at the measured plateau
+  bool grant_learned_min_{true};  // SIRIUS_GRANT_LEARNED_MIN=0: plan one-task minimum for every query
+  bool queue_demote_{false};  // SIRIUS_QUEUE_DEMOTE: demote resident tables when the queue is blocked
+  int mpl_{4};
+  int mpl_dir_{1};
+  std::size_t mpl_window_done_{0};
+  std::chrono::steady_clock::time_point mpl_window_start_{};
+  double mpl_last_tput_{0};
+  bool mpl_window_demand_{false};  // queries waited during the window (only then adjust)
+  double mpl_window_work_ms_{0};    // solo-equivalent work completed in the window
+  std::unordered_map<std::uint64_t, double> solo_ms_;  // fp -> best solo run time (ms)
+  std::unordered_map<std::uint64_t, std::vector<std::size_t>> learned_min_;  // fp -> min grants
+  std::atomic<std::size_t> resident_gpu_bytes_{0};  // data grants, refreshed by the watcher
+  std::size_t committed_grant() const;              // caller holds query_lifecycle_mutex_
+  std::size_t gpu_resident_bytes_scan();             // walks the pin registry
+  void demote_for_deficit(std::size_t deficit);
+  std::chrono::steady_clock::time_point last_queue_demote_{};
+  std::chrono::steady_clock::time_point queue_empty_since_{};
   std::unordered_map<std::uint64_t, live_window> live_windows_;  // by admission seq
   struct waiter {
     std::chrono::steady_clock::time_point since;

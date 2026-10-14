@@ -1038,7 +1038,11 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // may hold runtime state at once. Default 1 = the historical single-flight
   // behavior. Set before any query can reach acquire_query_lifecycle_slot.
   query_lifecycle_slots_ = std::max(1, config_.get_scan_manager_config().max_concurrent_queries);
-  if (auto const* v = std::getenv("SIRIUS_MEMORY_MANAGER"); v != nullptr && std::string(v) == "1") {
+  bool const grant_env = [] {
+    auto const* g = std::getenv("SIRIUS_GRANT_MANAGER");
+    return g != nullptr && std::string(g) == "1";
+  }();
+  if (auto const* v = std::getenv("SIRIUS_MEMORY_MANAGER"); grant_env || (v != nullptr && std::string(v) == "1")) {
     // One switch for the whole manager. Defaults go into members (never setenv: mutating the
     // environment races with getenv on other threads); explicit env settings parsed below win.
     memory_manager_mode_     = true;
@@ -1054,6 +1058,14 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     }
     if (std::getenv("SIRIUS_SHARED_SCAN_MB") == nullptr) {
       sirius::scan_manager::shared_scan_cache::instance().set_budget_bytes(2048ULL << 20);
+    }
+    if (grant_env) {
+      // Grant manager: minimum grants replace the peak projections (learned peaks with a
+      // margin and the runtime correction both charge elastic memory).
+      grant_mode_          = true;
+      admit_learned_scale_ = 0;
+      admit_runtime_       = false;
+      adaptive_mpl_        = true;
     }
   }
   if (auto const* v = std::getenv("SIRIUS_BUDGET_DRAIN_MS")) { budget_drain_ms_ = std::atoi(v); }
@@ -1074,6 +1086,16 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   if (auto const* v = std::getenv("SIRIUS_ADMIT_AGING_MS")) { admit_aging_ms_ = std::stoi(v); }
   if (auto const* v = std::getenv("SIRIUS_ADMIT_AGING_REL")) { admit_aging_rel_ = std::stod(v); }
   if (auto const* v = std::getenv("SIRIUS_AUTO_DEMOTE")) { auto_demote_ = std::string(v) == "1"; }
+  if (auto const* v = std::getenv("SIRIUS_QUEUE_DEMOTE")) { queue_demote_ = std::string(v) == "1"; }
+  if (auto const* v = std::getenv("SIRIUS_ADAPTIVE_MPL")) { adaptive_mpl_ = std::string(v) == "1"; }
+  if (auto const* v = std::getenv("SIRIUS_GRANT_LEARNED_MIN")) { grant_learned_min_ = std::string(v) == "1"; }
+  if (auto const* v = std::getenv("SIRIUS_MPL_INIT")) { mpl_ = std::max(1, std::atoi(v)); }
+  if (auto const* v = std::getenv("SIRIUS_MPL_FIXED")) {
+    // Concurrency limit at the GPU's measured throughput plateau (no online adaptation).
+    mpl_fixed_    = true;
+    adaptive_mpl_ = false;
+    mpl_          = std::max(1, std::atoi(v));
+  }
   if (auto const* v = std::getenv("SIRIUS_ADMIT_BESTFIT")) { admit_bestfit_ = std::string(v) == "1"; }
   if (auto const* v = std::getenv("SIRIUS_ADMIT_DEVICE_MARGIN_GB")) {
     admit_device_aware_  = true;
@@ -2309,6 +2331,20 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
         learned = true;
       }
     }
+    // Charged need: the projection, or in grant mode the minimum grant (learned from the
+    // engine's ledger for seen templates; one task of the largest pipeline from the plan
+    // for unseen ones).
+    std::size_t need = projected;
+    if (grant_mode_) {
+      need = admit_default_bytes_;
+      auto it = learned_min_.find(fingerprint);
+      if (grant_learned_min_ && fingerprint != 0 && it != learned_min_.end() && !it->second.empty()) {
+        need    = *std::max_element(it->second.begin(), it->second.end());
+        learned = true;
+      } else if (features.valid && features.need_task > 0) {
+        need = static_cast<std::size_t>(features.need_task);
+      }
+    }
     if (admit_gpu_bytes_ == 0) {
       query_lifecycle_cv_.wait(lock,
                                [this] { return query_lifecycle_active_ < query_lifecycle_slots_; });
@@ -2316,8 +2352,9 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
       // Memory-gated admission: GPU allocations are not signalled through the
       // cv, so poll. The first window is always admitted (no deadlock).
       auto const my_waiter = ++waiter_seq_;
-      auto can_admit       = [this, projected, my_waiter] {
+      auto can_admit       = [this, need, my_waiter] {
         if (query_lifecycle_active_ >= query_lifecycle_slots_) { return false; }
+        if ((adaptive_mpl_ || mpl_fixed_) && query_lifecycle_active_ >= mpl_) { return false; }
         if (query_lifecycle_active_ == 0) { return true; }
         if (std::chrono::steady_clock::now() - last_admit_ <
             std::chrono::milliseconds(admit_gap_ms_)) {
@@ -2326,7 +2363,9 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
         if (!preadmit_) { return gpu_allocated_bytes() <= admit_gpu_bytes_; }
         // Pre-admission: charge live windows their projections (they may not
         // have allocated yet), but never assume less than what is allocated.
-        auto committed = committed_bytes() + projected;
+        // Grant mode charges minimum grants against resident + shared + held state, with no
+        // floor at current allocation (that floor charges elastic memory and serializes).
+        auto committed = (grant_mode_ ? committed_grant() : committed_bytes()) + need;
         // Aging: the oldest waiter past the threshold keeps room for itself.
         int aging_ms = admit_aging_ms_;
         if (admit_aging_rel_ > 0 && recent_run_ms_.size() >= 8) {
@@ -2344,9 +2383,9 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
         if (committed > budget) { return false; }
         // Best-fit: if a larger waiter also fits right now, let it go first.
         if (admit_bestfit_) {
-          auto const base = committed - projected;
+          auto const base = committed - need;
           for (auto const& [seq, w] : waiters_) {
-            if (seq != my_waiter && w.projected > projected && base + w.projected <= budget) {
+            if (seq != my_waiter && w.projected > need && base + w.projected <= budget) {
               return false;
             }
           }
@@ -2354,7 +2393,7 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
         return true;
       };
       ++query_lifecycle_waiting_;
-      waiters_[my_waiter] = waiter{wait_start, projected};
+      waiters_[my_waiter] = waiter{wait_start, need};
       auto timed_can_admit = [&] {
         auto const t0 = std::chrono::steady_clock::now();
         bool const ok = can_admit();
@@ -2382,8 +2421,9 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
     t_window.peers_at_admit = query_lifecycle_active_;
     t_window.wait_start     = wait_start;
     t_window.admitted       = std::chrono::steady_clock::now();
-    live_projected_bytes_ += preadmit_ ? projected : 0;
-    live_windows_[t_window.admission_seq] = live_window{preadmit_ ? projected : 0, 0};
+    live_projected_bytes_ += preadmit_ ? (grant_mode_ ? need : projected) : 0;
+    t_window.projected = grant_mode_ ? need : t_window.projected;
+    live_windows_[t_window.admission_seq] = live_window{preadmit_ ? need : 0, 0};
     ++query_lifecycle_active_;
     if (query_lifecycle_active_ > query_lifecycle_peak_.load(std::memory_order_relaxed)) {
       query_lifecycle_peak_.store(query_lifecycle_active_, std::memory_order_relaxed);
@@ -2416,17 +2456,59 @@ void SiriusContext::release_query_lifecycle_slot() noexcept
     live_windows_.erase(t_window.admission_seq);
     // Solo window: started with nothing live and nobody was admitted since.
     solo = t_window.started_alone && admissions_ == t_window.admission_seq;
+    if (adaptive_mpl_ && t_window.fingerprint != 0) {
+      auto const now = std::chrono::steady_clock::now();
+      // Work-normalized throughput: credit each completion with its template's solo run time,
+      // so a window of cheap queries does not look "fast" (the template mix varies 10x).
+      double const run_ms = std::chrono::duration<double, std::milli>(now - t_window.admitted).count();
+      bool const alone    = t_window.started_alone && admissions_ == t_window.admission_seq;
+      auto solo_it        = solo_ms_.find(t_window.fingerprint);
+      if (alone) {
+        if (solo_it == solo_ms_.end()) {
+          solo_ms_[t_window.fingerprint] = run_ms;
+        } else {
+          solo_it->second = std::min(solo_it->second, run_ms);
+        }
+        solo_it = solo_ms_.find(t_window.fingerprint);
+      }
+      mpl_window_work_ms_ += solo_it != solo_ms_.end() ? solo_it->second : run_ms;
+      if (mpl_window_start_ == std::chrono::steady_clock::time_point{}) { mpl_window_start_ = now; }
+      constexpr std::size_t kWindow = 24;  // completions per measurement window
+      if (!waiters_.empty()) { mpl_window_demand_ = true; }
+      if (++mpl_window_done_ >= kWindow && !mpl_window_demand_) {
+        // No demand beyond the limit: nothing to learn; restart the window.
+        mpl_window_done_    = 0;
+        mpl_window_start_   = now;
+        mpl_window_work_ms_ = 0;
+      } else if (mpl_window_done_ >= kWindow) {
+        double const secs = std::chrono::duration<double>(now - mpl_window_start_).count();
+        double const tput = secs > 0 ? (mpl_window_work_ms_ / 1000.0) / secs : 0;  // solo-s per s
+        // Keep climbing while throughput improves by >2%; otherwise reverse direction.
+        if (mpl_last_tput_ > 0 && tput < mpl_last_tput_ * 1.02) { mpl_dir_ = -mpl_dir_; }
+        mpl_last_tput_   = tput;
+        mpl_              = std::clamp(mpl_ + mpl_dir_, 1, std::max(1, query_lifecycle_slots_));
+        mpl_window_done_    = 0;
+        mpl_window_start_   = now;
+        mpl_window_demand_  = false;
+        mpl_window_work_ms_ = 0;
+        SIRIUS_LOG_INFO("SiriusContext: adaptive MPL -> {} ({:.2f} solo-s/s)", mpl_, tput);
+      }
+    }
     if (t_window.admitted.time_since_epoch().count() != 0) {
       recent_run_ms_.push_back(std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - t_window.admitted).count());
       if (recent_run_ms_.size() > 64) { recent_run_ms_.pop_front(); }
     }
     if (t_window.query_id != 0) {
-      engine_peak = sirius::memory::query_memory_ledger::instance().take_peak(t_window.query_id);
+      auto const summary = sirius::memory::query_memory_ledger::instance().take(t_window.query_id);
+      engine_peak        = summary.peak;
       if (engine_peak > 0 && t_window.fingerprint != 0) {
         auto& hist = learned_peaks_[t_window.fingerprint];
         hist.push_back(engine_peak);
         if (hist.size() > 3) { hist.erase(hist.begin()); }
+        auto& mins = learned_min_[t_window.fingerprint];
+        mins.push_back(summary.min_grant());
+        if (mins.size() > 3) { mins.erase(mins.begin()); }
       }
     }
     if (solo && !footprint_log_path_.empty()) {
@@ -2519,7 +2601,21 @@ void SiriusContext::demote_for_budget(std::size_t new_budget)
     need = largest_need_bytes();
   }
   if (resident + need <= new_budget) { return; }
-  std::size_t const deficit = resident + need - new_budget;
+  demote_for_deficit(resident + need - new_budget);
+}
+
+void SiriusContext::demote_for_deficit(std::size_t deficit)
+{
+  std::vector<std::pair<std::string, std::size_t>> tables;
+  get_scan_manager().visit_pinned_entries([&](std::string_view name, sirius::scan_manager::pinned_entry const& e) {
+    if (e.tier != cucascade::memory::Tier::GPU || e.data_batches_by_column.empty()) { return true; }
+    std::size_t bytes = 0;
+    for (auto const& [col, chunks] : e.data_batches_by_column) {
+      for (auto const& c : chunks) { bytes += c ? c->alloc_size() : 0; }
+    }
+    tables.emplace_back(std::string(name), bytes);
+    return true;
+  });
   // Cost of demoting a set = data the workload must then fetch from host: sum(uses x bytes),
   // with uses = scans each table has served. Exhaustive over the (few) resident tables.
   auto uses = get_scan_manager().entry_uses();
@@ -2603,6 +2699,32 @@ std::size_t SiriusContext::admit_budget() const
   auto const device_budget = gpu_allocated_bytes() + free_b;
   auto const cap = device_budget > admit_device_margin_ ? device_budget - admit_device_margin_ : 0;
   return std::min(admit_gpu_bytes_, cap);
+}
+
+std::size_t SiriusContext::committed_grant() const
+{
+  // Data grants (resident tables) + shared grants (shared-scan copies held by the cache) +
+  // each live window's max(minimum grant, materialized state it holds now).
+  std::size_t sum = resident_gpu_bytes_.load(std::memory_order_relaxed) +
+                    sirius::scan_manager::shared_scan_cache::instance().strong_bytes();
+  auto& ledger = sirius::memory::query_memory_ledger::instance();
+  for (auto const& [seq, w] : live_windows_) {
+    sum += std::max(w.projected, w.query_id != 0 ? ledger.held(w.query_id) : 0);
+  }
+  return sum;
+}
+
+std::size_t SiriusContext::gpu_resident_bytes_scan()
+{
+  std::size_t total = 0;
+  get_scan_manager().visit_pinned_entries([&](std::string_view, sirius::scan_manager::pinned_entry const& e) {
+    if (e.tier != cucascade::memory::Tier::GPU) { return true; }
+    for (auto const& [col, chunks] : e.data_batches_by_column) {
+      for (auto const& c : chunks) { total += c ? c->alloc_size() : 0; }
+    }
+    return true;
+  });
+  return total;
 }
 
 std::size_t SiriusContext::committed_bytes() const
@@ -2744,7 +2866,7 @@ void SiriusContext::start_budget_watcher_if_requested()
   auto const* ppath = std::getenv("SIRIUS_PLACEMENT_FILE");
   bool const has_budget    = bpath != nullptr && *bpath != '\0';
   bool const has_placement = ppath != nullptr && *ppath != '\0';
-  if (!has_budget && !has_placement) { return; }
+  if (!has_budget && !has_placement && !grant_mode_) { return; }
   budget_thread_ = std::thread([this,
                                 file      = std::string(has_budget ? bpath : ""),
                                 placement = std::string(has_placement ? ppath : "")] {
@@ -2753,7 +2875,7 @@ void SiriusContext::start_budget_watcher_if_requested()
     while (!memlog_stop_.load(std::memory_order_relaxed)) {
       // Placement commands (experimental): "demote <table>" / "promote <table>", one per line,
       // appended over time; each new line runs once.
-      if (!placement.empty()) {
+      if (!placement.empty() && is_initialized_) {
         if (std::FILE* pf = std::fopen(placement.c_str(), "r")) {
           char buf[512];
           std::size_t line_no = 0;
@@ -2784,6 +2906,55 @@ void SiriusContext::start_budget_watcher_if_requested()
           }
           std::fclose(pf);
         }
+      }
+      if (grant_mode_ && is_initialized_) try {
+        // Data grants: refresh resident GPU bytes (pins, demotions, promotions).
+        resident_gpu_bytes_.store(gpu_resident_bytes_scan(), std::memory_order_relaxed);
+        // Queue-driven placement: if the oldest waiter's minimum grant cannot fit, demote the
+        // cheapest resident tables (min sum(uses x bytes)) to make room; when the queue stays
+        // empty, promote them back. Rate-limited.
+        std::size_t deficit = 0;
+        bool queue_empty    = true;
+        auto const now      = std::chrono::steady_clock::now();
+        {
+          std::lock_guard<std::mutex> lock(query_lifecycle_mutex_);
+          queue_empty = waiters_.empty();
+          if (!queue_empty) {
+            auto const& oldest = waiters_.begin()->second;
+            double median_ms   = 1000;
+            if (recent_run_ms_.size() >= 8) {
+              std::vector<double> v(recent_run_ms_.begin(), recent_run_ms_.end());
+              std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+              median_ms = v[v.size() / 2];
+            }
+            bool const starving =
+              now - oldest.since > std::chrono::milliseconds(static_cast<int>(std::max(1000.0, 2 * median_ms)));
+            auto const need = committed_grant() + oldest.projected;
+            auto const cap  = admit_budget();
+            if (starving && need > cap) { deficit = need - cap; }
+          }
+        }
+        if (queue_demote_ && auto_demote_ && deficit > 0 && now - last_queue_demote_ > std::chrono::seconds(5)) {
+          last_queue_demote_ = now;
+          demote_for_deficit(deficit);
+          resident_gpu_bytes_.store(gpu_resident_bytes_scan(), std::memory_order_relaxed);
+        }
+        if (!queue_empty) {
+          queue_empty_since_ = {};
+        } else if (queue_empty_since_ == std::chrono::steady_clock::time_point{}) {
+          queue_empty_since_ = now;
+        } else if (queue_demote_ && auto_demote_ && !demoted_tables_.empty() && now - queue_empty_since_ > std::chrono::seconds(5)) {
+          std::size_t cap = 0;
+          {
+            std::lock_guard<std::mutex> lock(query_lifecycle_mutex_);
+            cap = admit_budget();
+          }
+          promote_for_budget(cap);
+          queue_empty_since_ = now;
+        }
+      } catch (std::exception const& e) {
+        // Never let the watcher abort the engine; log and retry on the next tick.
+        SIRIUS_LOG_WARN("SiriusContext: grant watcher tick failed: {}", e.what());
       }
       if (file.empty()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));

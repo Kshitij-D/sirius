@@ -47,7 +47,8 @@ class query_memory_ledger {
     std::lock_guard<std::mutex> lock(_mutex);
     auto& e = _entries[query];
     e.live += bytes;
-    e.peak = std::max(e.peak, e.live + e.held);
+    e.peak     = std::max(e.peak, e.live + e.held);
+    e.max_task = std::max(e.max_task, bytes);  // largest single task reservation
   }
 
   void sub(std::uint32_t query, std::size_t bytes)
@@ -64,7 +65,8 @@ class query_memory_ledger {
     std::lock_guard<std::mutex> lock(_mutex);
     auto& e = _entries[query];
     e.held += bytes;
-    e.peak = std::max(e.peak, e.live + e.held);
+    e.peak      = std::max(e.peak, e.live + e.held);
+    e.peak_held = std::max(e.peak_held, e.held);
   }
 
   void sub_held(std::uint32_t query, std::size_t bytes)
@@ -83,22 +85,43 @@ class query_memory_ledger {
     return it == _entries.end() ? 0 : it->second.live + it->second.held;
   }
 
-  /// Peak reserved bytes of a finished query; forgets the query.
-  std::size_t take_peak(std::uint32_t query)
+  /// Intermediate results a live query holds right now.
+  [[nodiscard]] std::size_t held(std::uint32_t query) const
   {
     std::lock_guard<std::mutex> lock(_mutex);
     auto it = _entries.find(query);
-    if (it == _entries.end()) { return 0; }
-    auto peak = it->second.peak;
-    _entries.erase(it);
-    return peak;
+    return it == _entries.end() ? 0 : it->second.held;
   }
+
+  struct summary {
+    std::size_t peak{0};       ///< max(live reservations + held): the most it ever used (max grant)
+    std::size_t max_task{0};   ///< largest single task reservation
+    std::size_t peak_held{0};  ///< most materialized state held at once
+    /// Minimum grant: enough to run its largest task while holding its state.
+    [[nodiscard]] std::size_t min_grant() const noexcept { return max_task + peak_held; }
+  };
+
+  /// Summary of a finished query; forgets the query.
+  summary take(std::uint32_t query)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    auto it = _entries.find(query);
+    if (it == _entries.end()) { return {}; }
+    summary s{it->second.peak, it->second.max_task, it->second.peak_held};
+    _entries.erase(it);
+    return s;
+  }
+
+  /// Peak reserved bytes of a finished query; forgets the query.
+  std::size_t take_peak(std::uint32_t query) { return take(query).peak; }
 
  private:
   struct entry {
     std::size_t live{0};
     std::size_t held{0};
     std::size_t peak{0};
+    std::size_t max_task{0};
+    std::size_t peak_held{0};
   };
   mutable std::mutex _mutex;
   std::unordered_map<std::uint32_t, entry> _entries;

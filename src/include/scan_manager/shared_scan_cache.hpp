@@ -113,6 +113,13 @@ class shared_scan_cache {
     return it == _position.end() ? 0 : it->second;
   }
 
+  /// Bytes the cache itself keeps alive (the strong buffer): the shared grant.
+  [[nodiscard]] std::size_t strong_bytes() const
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _strong_bytes;
+  }
+
   [[nodiscard]] std::size_t hits() const noexcept { return _hits.load(); }
   [[nodiscard]] std::size_t misses() const noexcept { return _misses.load(); }
 
@@ -144,7 +151,7 @@ class shared_scan_cache {
 
   std::size_t _budget_bytes{0};
   cucascade::memory::memory_space* _gpu_space{nullptr};
-  std::mutex _mutex;
+  mutable std::mutex _mutex;
   std::unordered_map<std::string, std::weak_ptr<cudf::column>> _weak;
   std::deque<strong_ref> _strong;
   std::size_t _strong_bytes{0};
