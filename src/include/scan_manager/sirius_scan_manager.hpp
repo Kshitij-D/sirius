@@ -681,6 +681,10 @@ class sirius_scan_manager {
   /// tier demotion/promotion to read an entry it is about to replace).
   [[nodiscard]] std::shared_ptr<const pinned_entry> get_pinned_entry(const std::string& name) const;
 
+  /// How many scans each pinned entry has served (experimental; the memory manager's
+  /// measure of a table's value when choosing what to demote).
+  [[nodiscard]] std::unordered_map<std::string, std::size_t> entry_uses() const;
+
   /// The pinned entry whose duckdb identity matches catalog.schema.table, or nullptr.
   /// OWNING: the returned shared_ptr keeps the entry alive for as long as the caller holds
   /// it, so a concurrent unpin on another connection cannot pull it out from under the
@@ -875,6 +879,8 @@ class sirius_scan_manager {
   /// snapshot in try_match_cached_entry, never across match/validate/plan work, so
   /// concurrent prepares do not serialize behind each other.
   mutable std::mutex _pinned_entries_mutex;
+  mutable std::mutex _entry_uses_mutex;
+  std::unordered_map<std::string, std::size_t> _entry_uses;
 
   //! One entry per in-flight query. Guarded by _query_states_mutex; the shared_ptr is
   //! resolved under the lock and used outside it, so an erase racing a reader cannot pull

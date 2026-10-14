@@ -15,6 +15,8 @@
  */
 
 #include "scan_manager/sirius_scan_manager.hpp"
+#include "data/sirius_converter_registry.hpp"
+#include "scan_manager/shared_scan_cache.hpp"
 
 #include "compression/decompression_pushdown_policy.hpp"
 #include "compression/device_compressed_blob.hpp"
@@ -86,6 +88,12 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
+
+#include <mutex>
+
+#include <cucascade/cudf/host_data_representation.hpp>
+
+#include <rmm/cuda_stream.hpp>
 
 namespace sirius::scan_manager {
 
@@ -342,7 +350,9 @@ struct cached_databatch_provider : public databatch_provider {
       out.preferred_device = delta.preferred_device;
       return out;
     }
-    auto const index = _plan.survivor_chunk_indices[cursor];
+    auto const n_survivors = _plan.survivor_chunk_indices.size();
+    std::call_once(_share_once, [this, n_survivors] { init_shared_scan(n_survivors); });
+    auto const index = _plan.survivor_chunk_indices[(cursor + _share_rotation) % n_survivors];
     std::shared_ptr<cucascade::data_batch> data;
     if (_entry.tier == cucascade::memory::Tier::GPU) {
       data = get_device_databatch(index);
@@ -370,11 +380,81 @@ struct cached_databatch_provider : public databatch_provider {
   }
 
  private:
+  // Cooperative shared scan (experimental; see shared_scan_cache.hpp).
+  std::once_flag _share_once;
+  std::size_t _share_rotation{0};
+  std::string _share_key;  // non-empty when this scan shares GPU copies of host chunks
+
+  void init_shared_scan(std::size_t n_survivors)
+  {
+    auto& cache = shared_scan_cache::instance();
+    if (_entry.tier != cucascade::memory::Tier::HOST || !cache.enabled() || n_survivors == 0) { return; }
+    _share_key = _entry.cache_info.compression_plan_key();
+    // Start where scans in flight on this table are, and wrap around. Not with late
+    // materialization, which tracks row positions per scan.
+    if (_origin_columns) { return; }
+    auto const hint = cache.position(_share_key);
+    for (std::size_t p = 0; p < n_survivors; ++p) {
+      if (_plan.survivor_chunk_indices[p] >= hint) {
+        _share_rotation = p;
+        break;
+      }
+    }
+  }
+
+  // GPU batch for host chunk @p index assembled from shared GPU columns: columns another
+  // scan already brought over are reused; the missing ones are copied once and published.
+  std::shared_ptr<cucascade::data_batch> get_shared_host_databatch(
+    std::size_t index, cucascade::host_data_representation& host)
+  {
+    auto& cache = shared_scan_cache::instance();
+    std::vector<std::shared_ptr<cudf::column>> columns(_column_indices.size());
+    std::vector<std::size_t> missing_pos;
+    std::vector<std::size_t> missing_idx;
+    for (std::size_t k = 0; k < _column_indices.size(); ++k) {
+      columns[k] = cache.get(_share_key, index, _column_indices[k]);
+      if (!columns[k]) {
+        missing_pos.push_back(k);
+        missing_idx.push_back(_column_indices[k]);
+      }
+    }
+    if (!missing_idx.empty()) {
+      thread_local rmm::cuda_stream stream;
+      auto slice    = host.slice(missing_idx);
+      auto gpu_repr = converter_registry::get().convert<cucascade::gpu_table_representation>(
+        *slice, cache.gpu_space(), stream.view());
+      auto table = gpu_repr->release_table(stream.view());
+      stream.synchronize();
+      auto released = table->release();
+      for (std::size_t j = 0; j < released.size(); ++j) {
+        std::shared_ptr<cudf::column> col(std::move(released[j]));
+        columns[missing_pos[j]] = cache.put(_share_key, index, missing_idx[j], std::move(col));
+      }
+    }
+    cache.note_position(_share_key, index);
+    std::vector<cudf::column_view> views;
+    std::size_t alloc_size = 0;
+    for (auto const& c : columns) {
+      views.emplace_back(c->view());
+      alloc_size += c->alloc_size();
+    }
+    auto gpu_repr = std::make_unique<::cucascade::gpu_table_representation>(
+      cudf::table_view(views), std::move(columns), alloc_size, *cache.gpu_space(), rmm::cuda_stream_view{});
+    const auto batch_id = ::sirius::get_next_batch_id();
+    return ::cucascade::data_batch::make(
+      batch_id, std::move(gpu_repr), telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
+  }
+
   std::shared_ptr<cucascade::data_batch> get_host_databatch(std::size_t index)
   {
     if (index >= _entry.host_chunks.size()) { return nullptr; }
     const auto& chunk = _entry.host_chunks.at(index);
     if (!chunk) { return nullptr; }
+    if (!_share_key.empty()) {
+      if (auto* host = dynamic_cast<cucascade::host_data_representation*>(chunk.get())) {
+        return get_shared_host_databatch(index, *host);
+      }
+    }
     if (auto* compressed = dynamic_cast<sirius::compressed_host_representation*>(chunk.get())) {
       auto projected = compressed->select_columns(_column_indices);
       return cucascade::data_batch::make(get_next_batch_id(), std::move(projected));
@@ -1102,6 +1182,10 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
         _topology_index->gpu_ids().size() == 1) {
       try_install_late_mat_deferral(
         assignment.op, *assignment.entry, assignment.columns, &late_mat_ctx);
+      {
+        std::lock_guard lk{_entry_uses_mutex};
+        ++_entry_uses[assignment.entry_name];
+      }
     }
     // The scan's filter as the decompressor can use it: columns the query only
     // ever tests for equality and never projects can come back as the boolean
@@ -1928,6 +2012,12 @@ std::size_t pinned_host_chunk_rows(cucascade::idata_representation const& chunk)
 }
 
 }  // namespace
+
+std::unordered_map<std::string, std::size_t> sirius_scan_manager::entry_uses() const
+{
+  std::lock_guard lk{_entry_uses_mutex};
+  return _entry_uses;
+}
 
 std::shared_ptr<const pinned_entry> sirius_scan_manager::get_pinned_entry(const std::string& name) const
 {

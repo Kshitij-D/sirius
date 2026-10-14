@@ -39,6 +39,7 @@
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/cuda_device.hpp>
+#include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
@@ -887,6 +888,14 @@ device_pin_result materialize_all_batches_compressed(
 }
 
 namespace {
+// Placement copies allocate buffers that outlive the call (RMM frees a buffer on the stream
+// it was allocated on), so they use one process-lifetime stream, never a temporary one.
+rmm::cuda_stream& placement_stream()
+{
+  static auto* stream = new rmm::cuda_stream();  // intentionally leaked
+  return *stream;
+}
+
 // Clone a pinned entry's zone maps into the capture shape the insert APIs take
 // (chunk-major: stats[chunk][column]); empty when the entry has none.
 void clone_zone_maps(scan_manager::pinned_entry const& e,
@@ -925,7 +934,7 @@ std::size_t demote_pinned_table_to_host(scan_manager::sirius_scan_manager& scan_
   auto const names     = old->cache_info.column_names();
   auto const n_chunks  = old->chunk_memory_spaces.size();
   auto& registry       = converter_registry::get();
-  rmm::cuda_stream stream;
+  auto& stream         = placement_stream();
   std::vector<std::shared_ptr<cucascade::idata_representation>> host_chunks;
   host_chunks.reserve(n_chunks);
   std::size_t moved = 0;
@@ -971,7 +980,7 @@ std::size_t promote_pinned_table_to_gpu(scan_manager::sirius_scan_manager& scan_
   auto old = scan_mgr.get_pinned_entry(name);
   if (!old || old->tier != cucascade::memory::Tier::HOST || old->host_chunks.empty()) { return 0; }
   auto& registry = converter_registry::get();
-  rmm::cuda_stream stream;
+  auto& stream   = placement_stream();
   std::vector<std::unique_ptr<cudf::table>> tables;
   std::vector<cucascade::memory::memory_space*> spaces;
   std::size_t moved = 0;

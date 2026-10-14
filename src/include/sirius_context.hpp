@@ -41,6 +41,7 @@
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <deque>
 #include <unordered_map>
 #include <condition_variable>
 #include <functional>
@@ -990,6 +991,16 @@ class SiriusContext : public ClientContextState {
   std::unordered_map<std::uint64_t, std::vector<std::size_t>> learned_peaks_;
   std::string querylog_path_;  // SIRIUS_QUERYLOG
   bool admit_runtime_{false};
+  // Unified memory manager (SIRIUS_MEMORY_MANAGER=1): all layers on, settings derived
+  // from engine state; auto demotion/promotion of pinned tables on budget changes.
+  bool memory_manager_mode_{false};
+  bool auto_demote_{false};
+  double admit_aging_rel_{0};              // aging threshold = rel x median window run time
+  std::deque<double> recent_run_ms_;       // guarded by query_lifecycle_mutex_
+  std::vector<std::string> demoted_tables_;
+  std::size_t largest_need_bytes() const;  // caller holds query_lifecycle_mutex_
+  void demote_for_budget(std::size_t new_budget);
+  void promote_for_budget(std::size_t new_budget);
   bool admit_bestfit_{false};  // SIRIUS_ADMIT_BESTFIT: largest fitting waiter first
   std::size_t admit_device_margin_{0};
   bool admit_device_aware_{false};
