@@ -73,6 +73,8 @@ def main():
     p.add_argument("--cotenant", default=None,
                    help="delay_s,gib,hold_s: shrink Sirius budget at runtime, run a co-tenant hog, restore")
     p.add_argument("--budget-drain-ms", type=int, default=0, help="drain-then-shrink bound for runtime budget cuts")
+    p.add_argument("--demote", default=None,
+                   help="with --cotenant: tables to unpin (GPU -> storage) before the budget cut, re-pinned after restore")
     p.add_argument("--querylog", action="store_true", help="per-query wait/run/projection/engine peak -> <out>.q.tsv")
     p.add_argument("--tasklog", action="store_true", help="per-task Sirius estimate vs actual to <out>.task.tsv")
     p.add_argument("--admit-structural-field", default=None, choices=["min", "fast"])
@@ -210,6 +212,14 @@ def main():
             import subprocess as _sp
             d, g, h = (float(x) for x in a.cotenant.split(","))
             time.sleep(d)
+            if a.demote:
+                # Placement decision: give up residency of the named tables so the shrunk
+                # budget still covers the working set, instead of an OOM storm.
+                dc = con.cursor()
+                R["marks"]["demote_start"] = now()
+                for t in a.demote.split(","):
+                    dc.execute(f"CALL unpin_table('{t}')").fetchall()
+                R["marks"]["demote_done"] = now()
             R["marks"]["cotenant_shrink"] = now()
             open(budget_file, "w").write(f"{R0_budget - g - 1:.2f}\n")
             hog_out = _sp.run([os.path.join(os.path.dirname(os.path.abspath(__file__)), "hog"), "0", str(g), str(h), "30"],
@@ -217,6 +227,14 @@ def main():
             R["cotenant_hog"] = hog_out.strip()
             R["marks"]["cotenant_restore"] = now()
             open(budget_file, "w").write(f"{R0_budget:.2f}\n")
+            if a.demote:
+                from tpch_pin_columns import union_columns_by_table, _pin_call
+                cols = union_columns_by_table()
+                rc = con.cursor()
+                for t in a.demote.split(","):
+                    for st in _pin_call(t, cols[t], a.data, "parquet").split(";"):
+                        if st.strip(): rc.execute(st).fetchall()
+                R["marks"]["repin_done"] = now()
         threading.Thread(target=cotenant, daemon=True).start()
     hog = None
     if a.hog:
