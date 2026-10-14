@@ -75,8 +75,12 @@ def main():
     p.add_argument("--budget-drain-ms", type=int, default=0, help="drain-then-shrink bound for runtime budget cuts")
     p.add_argument("--demote", default=None,
                    help="with --cotenant: tables to unpin (GPU -> storage) before the budget cut, re-pinned after restore")
+    p.add_argument("--demote-mode", default="unpin", choices=["unpin", "engine"],
+                   help="unpin = drop to storage (driver prototype); engine = in-engine GPU->host demotion")
     p.add_argument("--demote-need-gb", type=float, default=11.0,
                    help="--demote auto: largest single-query GPU need the shrunk budget must still cover")
+    p.add_argument("--shared-scan-mb", type=float, default=0, help="cooperative shared scan buffer (MB) for host-tier tables")
+    p.add_argument("--memory-manager", action="store_true", help="SIRIUS_MEMORY_MANAGER=1: the unified manager, all layers")
     p.add_argument("--querylog", action="store_true", help="per-query wait/run/projection/engine peak -> <out>.q.tsv")
     p.add_argument("--tasklog", action="store_true", help="per-task Sirius estimate vs actual to <out>.task.tsv")
     p.add_argument("--admit-structural-field", default=None, choices=["min", "fast"])
@@ -130,6 +134,8 @@ def main():
     if a.task_chain_history: os.environ["SIRIUS_TASK_CHAIN_HISTORY"] = str(a.task_chain_history)
     if a.task_op_priors: os.environ["SIRIUS_TASK_OP_PRIORS"] = "1"
     if a.budget_drain_ms: os.environ["SIRIUS_BUDGET_DRAIN_MS"] = str(a.budget_drain_ms)
+    if a.shared_scan_mb: os.environ["SIRIUS_SHARED_SCAN_MB"] = str(a.shared_scan_mb)
+    if a.memory_manager: os.environ["SIRIUS_MEMORY_MANAGER"] = "1"
     if a.querylog: os.environ["SIRIUS_QUERYLOG"] = os.path.abspath(a.out + ".q.tsv")
     if a.tasklog: os.environ["SIRIUS_TASKLOG"] = os.path.abspath(a.out + ".task.tsv")
     if a.admit_structural_field: os.environ["SIRIUS_ADMIT_STRUCTURAL_FIELD"] = a.admit_structural_field
@@ -143,6 +149,8 @@ def main():
         R0_budget = a.gpu_frac * tot_gib
         open(budget_file, "w").write(f"{R0_budget:.2f}\n")
         os.environ["SIRIUS_BUDGET_FILE"] = budget_file
+        placement_file = os.path.abspath(a.out + ".placement"); open(placement_file, "w").close()
+        os.environ["SIRIUS_PLACEMENT_FILE"] = placement_file
     os.environ["SIRIUS_PIN_TIER"] = a.pin if a.pin != "none" else "gpu"
 
     R = dict(args=vars(a), max_conc=max_conc, marks={})
@@ -255,7 +263,11 @@ def main():
                 dc = con.cursor()
                 R["marks"]["demote_start"] = now()
                 for t in a.demote.split(","):
-                    dc.execute(f"CALL unpin_table('{t}')").fetchall()
+                    if a.demote_mode == "engine":
+                        open(placement_file, "a").write(f"demote {t}\n")
+                    else:
+                        dc.execute(f"CALL unpin_table('{t}')").fetchall()
+                if a.demote_mode == "engine": time.sleep(0.5)  # watcher polls every 100 ms; copies take ~0.2 s/12 GB
                 R["marks"]["demote_done"] = now()
             R["marks"]["cotenant_shrink"] = now()
             open(budget_file, "w").write(f"{R0_budget - g - 1:.2f}\n")
@@ -264,7 +276,11 @@ def main():
             R["cotenant_hog"] = hog_out.strip()
             R["marks"]["cotenant_restore"] = now()
             open(budget_file, "w").write(f"{R0_budget:.2f}\n")
-            if a.demote:
+            if a.demote and a.demote_mode == "engine":
+                for t in a.demote.split(","):
+                    open(placement_file, "a").write(f"promote {t}\n")
+                R["marks"]["repin_done"] = now()
+            elif a.demote:
                 from tpch_pin_columns import union_columns_by_table, _pin_call
                 cols = union_columns_by_table()
                 rc = con.cursor()
