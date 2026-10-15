@@ -217,8 +217,11 @@ def main():
     R["serial_sum_s"] = sum(R["serial_latency_s"].values())
     # fixed per-query overhead: trivial GPU query
     lat = []
+    # smallest table of this benchmark's schema (nation for TPC-H)
+    tiny = min((r[0] for r in con.execute("SELECT view_name FROM duckdb_views() WHERE NOT internal").fetchall()),
+               key=lambda v: con.execute(f"SELECT count(*) FROM {v}").fetchone()[0]) if a.benchmark == "tpcds" else "nation"
     for _ in range(20):
-        t = now(); con.execute("select count(*) from nation").fetchall(); lat.append(now() - t)
+        t = now(); con.execute(f"select count(*) from {tiny}").fetchall(); lat.append(now() - t)
     R["trivial_query_s"] = statistics.median(lat)
     R["marks"]["warm_end"] = now()
     print(f"serial sum {R['serial_sum_s']:.3f}s trivial {R['trivial_query_s']*1e3:.1f}ms", flush=True)
