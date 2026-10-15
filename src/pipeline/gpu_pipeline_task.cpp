@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "memory/memory_pressure.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include "cudf/cudf_utils.hpp"
@@ -225,6 +226,9 @@ std::unique_ptr<op::operator_data> run_one_operator(
   try {
     operator_output_data = op.execute(operator_input_data, stream);
   } catch (const std::exception& ex) {
+    // Work an OOM (or any failure) throws away counts as memory stall, not useful work.
+    sirius::memory::memory_pressure::instance().add_stall(std::chrono::high_resolution_clock::now() -
+                                                          start);
     auto sticky_err = cudaGetLastError();
     if (sticky_err != cudaSuccess) {
       SIRIUS_LOG_WARN("Pipeline {}: {} (id={}) threw + left sticky CUDA error: [{}] {} — clearing",
@@ -255,6 +259,7 @@ std::unique_ptr<op::operator_data> run_one_operator(
   stream.synchronize();
   auto end      = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+  sirius::memory::memory_pressure::instance().add_work(end - start);
 
   auto peak_bytes        = allocator ? allocator->get_peak_allocated_bytes(stream) : 0;
   std::string extra_info = std::format(

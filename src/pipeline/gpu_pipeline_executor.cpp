@@ -25,6 +25,7 @@
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/completion_handler.hpp"
+#include "memory/memory_pressure.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "pipeline/task_request.hpp"
 #include "telemetry/telemetry_context.hpp"
@@ -379,6 +380,8 @@ void gpu_pipeline_executor::prepare_and_execute(std::unique_ptr<parallel::itask>
       if (!wait_token.try_acquire(_memory_waiter_parked)) {
         reservation.reset();
         _memory_wait_requeues.fetch_add(1, std::memory_order_relaxed);
+        sirius::memory::memory_pressure::instance().count_requeue();
+        sirius::memory::memory_pressure::instance().add_stall(k_memory_wait_requeue_backoff);
         SIRIUS_LOG_DEBUG(
           "[GPU:{}] GPU Pipeline Executor: memory-wait slot busy, re-queueing task {} "
           "(pipeline {}, {} bytes wanted, {} available)",
@@ -679,6 +682,8 @@ void gpu_pipeline_executor::prepare_and_execute(std::unique_ptr<parallel::itask>
         // (cross-GPU processing contention, follow-up #17). 50 ms gives
         // typical SF100 probe tasks time to finish their current work
         // without putting the rescheduled task into a tight busy-spin.
+        sirius::memory::memory_pressure::instance().count_oom_reschedule();
+        sirius::memory::memory_pressure::instance().add_stall(std::chrono::milliseconds(50));
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
         // Schedule the rescheduled task. It goes back through manager_loop()

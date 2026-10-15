@@ -15,6 +15,7 @@
  */
 
 #include "memory/pinned_reservation_guard.hpp"
+#include "memory/memory_pressure.hpp"
 
 #include "compression/compressed_representation.hpp"
 #include "log/logging.hpp"
@@ -270,7 +271,11 @@ reservation_wait_scope::reservation_wait_scope(const cucascade::memory::memory_s
 {
 }
 
-reservation_wait_scope::~reservation_wait_scope() { wait_watchdog::instance().remove(_id); }
+reservation_wait_scope::~reservation_wait_scope()
+{
+  wait_watchdog::instance().remove(_id);
+  memory_pressure::instance().add_stall(std::chrono::steady_clock::now() - _start);
+}
 
 }  // namespace memory
 }  // namespace sirius

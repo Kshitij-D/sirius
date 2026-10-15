@@ -65,6 +65,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include "memory/memory_pressure.hpp"
 #include "memory/query_memory_ledger.hpp"
 #include "pin_table.hpp"
 #include "pipeline/chain_memory_history.hpp"
@@ -2803,7 +2804,8 @@ void SiriusContext::start_memlog_if_requested()
     std::FILE* f = std::fopen(file.c_str(), "w");
     if (f == nullptr) { return; }
     std::fprintf(f, "t,gpu_alloc,gpu_reserved,gpu_avail,host_reserved,live,waiting,budget,"
-                    "h2d_copied,h2d_reused,share_hits,share_misses,admit_decide_ns\n");
+                    "h2d_copied,h2d_reused,share_hits,share_misses,admit_decide_ns,stall_ns,work_ns,"
+                    "oom_resched,requeues\n");
     using namespace std::chrono;
     while (!memlog_stop_.load(std::memory_order_relaxed)) {
       double t = duration<double>(system_clock::now().time_since_epoch()).count();
@@ -2821,8 +2823,9 @@ void SiriusContext::start_memlog_if_requested()
         live    = query_lifecycle_active_;
         waiting = query_lifecycle_waiting_;
       }
+      auto const mp = sirius::memory::memory_pressure::instance().read();
       std::fprintf(f,
-                   "%.4f,%zu,%zu,%zu,%zu,%d,%d,%zu,%zu,%zu,%zu,%zu,%llu\n",
+                   "%.4f,%zu,%zu,%zu,%zu,%d,%d,%zu,%zu,%zu,%zu,%zu,%llu,%llu,%llu,%llu,%llu\n",
                    t,
                    gpu_allocated_bytes(),
                    gres,
@@ -2835,7 +2838,11 @@ void SiriusContext::start_memlog_if_requested()
                    sirius::scan_manager::shared_scan_cache::instance().reused_bytes(),
                    sirius::scan_manager::shared_scan_cache::instance().hits(),
                    sirius::scan_manager::shared_scan_cache::instance().misses(),
-                   static_cast<unsigned long long>(admit_decide_ns_.load()));
+                   static_cast<unsigned long long>(admit_decide_ns_.load()),
+                   static_cast<unsigned long long>(mp.stall_ns),
+                   static_cast<unsigned long long>(mp.work_ns),
+                   static_cast<unsigned long long>(mp.oom_reschedules),
+                   static_cast<unsigned long long>(mp.requeues));
       std::fflush(f);
       std::this_thread::sleep_for(milliseconds(10));
     }

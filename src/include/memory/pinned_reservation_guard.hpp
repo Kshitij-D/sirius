@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <chrono>
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -147,6 +149,7 @@ class reservation_wait_scope {
 
  private:
   std::uint64_t _id;
+  std::chrono::steady_clock::time_point _start{std::chrono::steady_clock::now()};
 };
 
 }  // namespace memory
