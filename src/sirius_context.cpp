@@ -46,6 +46,7 @@
 #include <cudf/utilities/pinned_memory.hpp>
 
 #include <rmm/cuda_device.hpp>
+#include <rmm/mr/cuda_async_memory_resource.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -2805,7 +2806,8 @@ void SiriusContext::start_memlog_if_requested()
     if (f == nullptr) { return; }
     std::fprintf(f, "t,gpu_alloc,gpu_reserved,gpu_avail,host_reserved,live,waiting,budget,"
                     "h2d_copied,h2d_reused,share_hits,share_misses,admit_decide_ns,stall_ns,work_ns,"
-                    "oom_resched,requeues\n");
+                    "oom_resched,requeues,g_resident,g_shared,g_min_sum,g_held_sum,g_committed,"
+                    "g_budget,pool_reserved,pool_used,drv_free\n");
     using namespace std::chrono;
     while (!memlog_stop_.load(std::memory_order_relaxed)) {
       double t = duration<double>(system_clock::now().time_since_epoch()).count();
@@ -2818,14 +2820,46 @@ void SiriusContext::start_memlog_if_requested()
         }
       }
       int live = 0, waiting = 0;
+      // Grant ledger terms (resident + shared + sum(max(min_q, held_q)) <= budget), sampled
+      // together so the invariant can be checked against real allocation offline.
+      std::size_t g_resident = resident_gpu_bytes_.load(std::memory_order_relaxed);
+      std::size_t g_shared   = sirius::scan_manager::shared_scan_cache::instance().strong_bytes();
+      std::size_t g_min_sum = 0, g_held_sum = 0, g_committed = g_resident + g_shared, g_budget = 0;
       {
         std::lock_guard<std::mutex> lock(query_lifecycle_mutex_);
         live    = query_lifecycle_active_;
         waiting = query_lifecycle_waiting_;
+        auto& ledger = sirius::memory::query_memory_ledger::instance();
+        for (auto const& [seq, w] : live_windows_) {
+          auto const held = w.query_id != 0 ? ledger.held(w.query_id) : 0;
+          g_min_sum += w.projected;
+          g_held_sum += held;
+          g_committed += std::max(w.projected, held);
+        }
+        g_budget = admit_gpu_bytes_ > 0 ? admit_budget() : 0;
       }
+      // CUDA pool state: reserved - used is free memory the pool holds (fragmentation).
+      std::uint64_t pool_reserved = 0, pool_used = 0;
+      std::size_t drv_free = 0, drv_total = 0;
+      for (auto const* sp :
+           memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+        if (sp == nullptr) { continue; }
+        if (auto const* mr = sp->get_memory_resource_of<cucascade::memory::Tier::GPU>()) {
+          auto upstream = mr->get_upstream_resource();
+          if (auto* amr = ::cuda::mr::resource_cast<rmm::mr::cuda_async_memory_resource>(&upstream)) {
+            std::uint64_t r = 0, u = 0;
+            cudaMemPoolGetAttribute(amr->pool_handle(), cudaMemPoolAttrReservedMemCurrent, &r);
+            cudaMemPoolGetAttribute(amr->pool_handle(), cudaMemPoolAttrUsedMemCurrent, &u);
+            pool_reserved += r;
+            pool_used += u;
+          }
+        }
+      }
+      cudaMemGetInfo(&drv_free, &drv_total);
       auto const mp = sirius::memory::memory_pressure::instance().read();
       std::fprintf(f,
-                   "%.4f,%zu,%zu,%zu,%zu,%d,%d,%zu,%zu,%zu,%zu,%zu,%llu,%llu,%llu,%llu,%llu\n",
+                   "%.4f,%zu,%zu,%zu,%zu,%d,%d,%zu,%zu,%zu,%zu,%zu,%llu,%llu,%llu,%llu,%llu,"
+                   "%zu,%zu,%zu,%zu,%zu,%zu,%llu,%llu,%zu\n",
                    t,
                    gpu_allocated_bytes(),
                    gres,
@@ -2842,7 +2876,16 @@ void SiriusContext::start_memlog_if_requested()
                    static_cast<unsigned long long>(mp.stall_ns),
                    static_cast<unsigned long long>(mp.work_ns),
                    static_cast<unsigned long long>(mp.oom_reschedules),
-                   static_cast<unsigned long long>(mp.requeues));
+                   static_cast<unsigned long long>(mp.requeues),
+                   g_resident,
+                   g_shared,
+                   g_min_sum,
+                   g_held_sum,
+                   g_committed,
+                   g_budget,
+                   static_cast<unsigned long long>(pool_reserved),
+                   static_cast<unsigned long long>(pool_used),
+                   drv_free);
       std::fflush(f);
       std::this_thread::sleep_for(milliseconds(10));
     }

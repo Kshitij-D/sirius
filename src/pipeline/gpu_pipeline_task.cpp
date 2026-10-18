@@ -41,6 +41,7 @@
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <data/data_batch_utils.hpp>
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -50,6 +51,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 
 
@@ -77,6 +79,111 @@ namespace sirius {
 namespace pipeline {
 
 namespace {
+
+// Experimental (env-gated, SIRIUS_TASKLOG): one row per task outcome for the admission study.
+// outcome is ok, oom_compute or oom_prepare, so estimate vs actual is visible for the tasks that
+// fail too. OOM rows carry the allocator and CUDA pool state at the failure: requested bytes,
+// global usage, pool reserved vs used (fragmentation) and driver free memory.
+thread_local std::chrono::system_clock::time_point t_task_start{};
+
+std::string const& tasklog_path()
+{
+  static std::string const path = [] {
+    auto const* v = std::getenv("SIRIUS_TASKLOG");
+    return std::string(v ? v : "");
+  }();
+  return path;
+}
+
+struct tasklog_event {
+  char const* outcome{"ok"};
+  std::size_t input_basis{0};
+  std::size_t reservation_bytes{0};
+  std::size_t peak_bytes{0};        // net of bytes_to_materialize_input
+  std::size_t output_bytes{0};
+  std::size_t task_alloc_bytes{0};  // held by this task's stream at the event
+  std::size_t requested_bytes{0};
+  std::size_t global_usage{0};
+  cudaMemPool_t pool{nullptr};
+  std::size_t op_index{0};
+};
+
+template <typename PipelinePtr>
+void tasklog_write(PipelinePtr const& pipeline,
+                   std::uint64_t task_id,
+                   std::optional<reservation_size_info> const& info,
+                   tasklog_event const& e)
+{
+  if (tasklog_path().empty() || !pipeline) { return; }
+  using namespace std::chrono;
+  auto const now   = system_clock::now();
+  double const t   = duration<double>(now.time_since_epoch()).count();
+  double const dur = t_task_start.time_since_epoch().count() == 0
+                       ? 0.0
+                       : duration<double, std::milli>(now - t_task_start).count();
+  std::uint64_t pool_reserved = 0, pool_used = 0;
+  std::size_t drv_free = 0, drv_total = 0;
+  if (e.pool != nullptr) {
+    cudaMemPoolGetAttribute(e.pool, cudaMemPoolAttrReservedMemCurrent, &pool_reserved);
+    cudaMemPoolGetAttribute(e.pool, cudaMemPoolAttrUsedMemCurrent, &pool_used);
+  }
+  if (std::string_view(e.outcome) != "ok") { cudaMemGetInfo(&drv_free, &drv_total); }
+  std::string ops;
+  for (auto& op_ref : pipeline->get_operators()) {
+    if (!ops.empty()) { ops += '>'; }
+    ops += op_ref.get().get_name();
+  }
+  // One buffered handle for the process: the log lives on a network file system, where an
+  // open/close per row serializes every task on the mutex. Flushed every 256 rows, on OOM rows
+  // and at exit.
+  static std::mutex tasklog_mutex;
+  static bool header_written = false;
+  static std::size_t rows    = 0;
+  std::lock_guard<std::mutex> lock(tasklog_mutex);
+  static std::FILE* f = [] {
+    std::FILE* h = std::fopen(tasklog_path().c_str(), "a");
+    if (h != nullptr) {
+      std::setvbuf(h, nullptr, _IOFBF, 1 << 20);
+      std::atexit([] {
+        if (f != nullptr) { std::fflush(f); }
+      });
+    }
+    return h;
+  }();
+  if (f == nullptr) { return; }
+  if (!header_written) {
+    std::fprintf(f,
+                 "t\tdur_ms\toutcome\tquery_id\tpipeline_id\ttask_id\tinput_basis\test_peak\t"
+                 "had_history\tmat_bytes\treservation\tpeak\toutput_bytes\ttask_alloc\trequested\t"
+                 "global_usage\tpool_reserved\tpool_used\tdrv_free\top_index\tops\n");
+    header_written = true;
+  }
+  std::fprintf(f,
+               "%.4f\t%.3f\t%s\t%u\t%zu\t%llu\t%zu\t%zu\t%d\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t"
+               "%llu\t%llu\t%zu\t%zu\t%s\n",
+               t,
+               dur,
+               e.outcome,
+               sirius::value_of(pipeline->get_query_id()),
+               static_cast<std::size_t>(pipeline->get_pipeline_id()),
+               static_cast<unsigned long long>(task_id),
+               e.input_basis,
+               info ? info->peak_memory_estimate : std::size_t{0},
+               info && info->had_history ? 1 : 0,
+               info ? info->bytes_to_materialize_input : std::size_t{0},
+               e.reservation_bytes,
+               e.peak_bytes,
+               e.output_bytes,
+               e.task_alloc_bytes,
+               e.requested_bytes,
+               e.global_usage,
+               static_cast<unsigned long long>(pool_reserved),
+               static_cast<unsigned long long>(pool_used),
+               drv_free,
+               e.op_index,
+               ops.c_str());
+  if (++rows % 256 == 0 || std::string_view(e.outcome) != "ok") { std::fflush(f); }
+}
 
 void validate_operator_output_types(const op::operator_data* data,
                                     const op::sirius_physical_operator& op)
@@ -432,10 +539,12 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
       }
       size_t requested_bytes = 0;
       size_t global_usage    = 0;
+      cudaMemPool_t oom_pool = nullptr;
       if (auto const* cc_oom =
             dynamic_cast<const cucascade::memory::cucascade_out_of_memory*>(&oom)) {
         requested_bytes = cc_oom->requested_bytes;
         global_usage    = cc_oom->global_usage;
+        oom_pool        = cc_oom->pool_handle;
       }
       size_t reservation_bytes =
         _local_state->cast<gpu_pipeline_task_local_state>().get_reservation_bytes();
@@ -473,6 +582,18 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
         chain_memory_history::get(chain_signature(global.get_pipeline()))
           .record_on_failure(input_basis, peak_bytes);
       }
+      tasklog_write(pipeline,
+                    _task_id,
+                    local_state.get_reservation_size_info(),
+                    tasklog_event{.outcome           = "oom_compute",
+                                  .input_basis       = input_basis,
+                                  .reservation_bytes = reservation_bytes,
+                                  .peak_bytes        = peak_bytes,
+                                  .task_alloc_bytes  = _allocator ? _allocator->get_allocated_bytes(stream) : 0,
+                                  .requested_bytes   = requested_bytes,
+                                  .global_usage      = global_usage,
+                                  .pool              = oom_pool,
+                                  .op_index          = i});
 
       throw oom_reschedule_exception(
         std::move(operator_input_output_data),
@@ -580,6 +701,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   };
 
   auto const prepare_start = std::chrono::high_resolution_clock::now();
+  t_task_start             = std::chrono::system_clock::now();
   auto reservation         = local_state.release_reservation();
   if (!reservation) { throw std::runtime_error("GPU pipeline task requires a memory reservation"); }
   auto reservation_bytes = reservation->size();
@@ -644,6 +766,20 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
         chain_memory_history::get(chain_signature(global.get_pipeline()))
           .record_on_failure(input_basis, peak_bytes);
       }
+    {
+      tasklog_event ev{.outcome           = "oom_prepare",
+                       .input_basis       = input_basis,
+                       .reservation_bytes = reservation_bytes,
+                       .peak_bytes        = peak_bytes,
+                       .task_alloc_bytes  = allocator->get_allocated_bytes(stream)};
+      if (auto const* cc_oom =
+            dynamic_cast<const cucascade::memory::cucascade_out_of_memory*>(&oom)) {
+        ev.requested_bytes = cc_oom->requested_bytes;
+        ev.global_usage    = cc_oom->global_usage;
+        ev.pool            = cc_oom->pool_handle;
+      }
+      tasklog_write(pipeline, _task_id, res_info, ev);
+    }
 
     SIRIUS_LOG_ERROR("Pipeline {}: OOM preparing batches for processing",
                      pipeline->get_pipeline_id());
@@ -725,36 +861,15 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
       chain_memory_history::get(chain_signature(pipeline)).record({input_basis, peak_bytes, output_bytes});
     }
     sirius::memory::query_memory_ledger::instance().add_held(ledger_query, output_bytes);
-    // Experimental (env-gated): per-task estimate vs actual, for the admission study.
-    static std::string const tasklog_path = [] {
-      auto const* v = std::getenv("SIRIUS_TASKLOG");
-      return std::string(v ? v : "");
-    }();
-    if (!tasklog_path.empty()) {
-      static std::mutex tasklog_mutex;
-      std::string ops;
-      for (auto& op_ref : pipeline->get_operators()) {
-        if (!ops.empty()) { ops += '>'; }
-        ops += op_ref.get().get_name();
-      }
-      auto const& info = local_state.get_reservation_size_info();
-      std::lock_guard<std::mutex> lock(tasklog_mutex);
-      if (std::FILE* f = std::fopen(tasklog_path.c_str(), "a")) {
-        std::fprintf(f,
-                     "%u\t%zu\t%llu\t%zu\t%zu\t%d\t%zu\t%zu\t%zu\t%s\n",
-                     sirius::value_of(pipeline->get_query_id()),
-                     pipeline->get_pipeline_id(),
-                     static_cast<unsigned long long>(_task_id),
-                     input_basis,
-                     info->peak_memory_estimate,
-                     info->had_history ? 1 : 0,
-                     static_cast<std::size_t>(reservation_bytes),
-                     static_cast<std::size_t>(peak_bytes),
-                     output_bytes,
-                     ops.c_str());
-        std::fclose(f);
-      }
-    }
+    // Experimental (env-gated, SIRIUS_TASKLOG): per-task estimate vs actual.
+    tasklog_write(pipeline,
+                  _task_id,
+                  local_state.get_reservation_size_info(),
+                  tasklog_event{.outcome           = "ok",
+                                .input_basis       = input_basis,
+                                .reservation_bytes = static_cast<std::size_t>(reservation_bytes),
+                                .peak_bytes        = static_cast<std::size_t>(peak_bytes),
+                                .output_bytes      = output_bytes});
     SIRIUS_LOG_TRACE(
       "[GPU:{}] Pipeline {}: memory history record - task={}, input_basis={}, output_bytes={}, "
       "reservation_bytes={}, peak_bytes={}, peak_bytes_to_materialize_input={}",
