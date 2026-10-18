@@ -106,6 +106,7 @@ struct tasklog_event {
   std::size_t global_usage{0};
   cudaMemPool_t pool{nullptr};
   std::size_t op_index{0};
+  int err_kind{0};  // cucascade MemoryError: 1 allocation failed upstream, 2 limit exceeded, 3 pool
 };
 
 template <typename PipelinePtr>
@@ -155,12 +156,12 @@ void tasklog_write(PipelinePtr const& pipeline,
     std::fprintf(f,
                  "t\tdur_ms\toutcome\tquery_id\tpipeline_id\ttask_id\tinput_basis\test_peak\t"
                  "had_history\tmat_bytes\treservation\tpeak\toutput_bytes\ttask_alloc\trequested\t"
-                 "global_usage\tpool_reserved\tpool_used\tdrv_free\top_index\tops\n");
+                 "global_usage\tpool_reserved\tpool_used\tdrv_free\top_index\terr_kind\tops\n");
     header_written = true;
   }
   std::fprintf(f,
                "%.4f\t%.3f\t%s\t%u\t%zu\t%llu\t%zu\t%zu\t%d\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t"
-               "%llu\t%llu\t%zu\t%zu\t%s\n",
+               "%llu\t%llu\t%zu\t%zu\t%d\t%s\n",
                t,
                dur,
                e.outcome,
@@ -181,6 +182,7 @@ void tasklog_write(PipelinePtr const& pipeline,
                static_cast<unsigned long long>(pool_used),
                drv_free,
                e.op_index,
+               e.err_kind,
                ops.c_str());
   if (++rows % 256 == 0 || std::string_view(e.outcome) != "ok") { std::fflush(f); }
 }
@@ -540,11 +542,13 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
       size_t requested_bytes = 0;
       size_t global_usage    = 0;
       cudaMemPool_t oom_pool = nullptr;
+      int oom_kind           = 0;
       if (auto const* cc_oom =
             dynamic_cast<const cucascade::memory::cucascade_out_of_memory*>(&oom)) {
         requested_bytes = cc_oom->requested_bytes;
         global_usage    = cc_oom->global_usage;
         oom_pool        = cc_oom->pool_handle;
+        oom_kind        = static_cast<int>(cc_oom->error_kind);
       }
       size_t reservation_bytes =
         _local_state->cast<gpu_pipeline_task_local_state>().get_reservation_bytes();
@@ -593,7 +597,8 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
                                   .requested_bytes   = requested_bytes,
                                   .global_usage      = global_usage,
                                   .pool              = oom_pool,
-                                  .op_index          = i});
+                                  .op_index          = i,
+                                  .err_kind          = oom_kind});
 
       throw oom_reschedule_exception(
         std::move(operator_input_output_data),
@@ -777,6 +782,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
         ev.requested_bytes = cc_oom->requested_bytes;
         ev.global_usage    = cc_oom->global_usage;
         ev.pool            = cc_oom->pool_handle;
+        ev.err_kind        = static_cast<int>(cc_oom->error_kind);
       }
       tasklog_write(pipeline, _task_id, res_info, ev);
     }
