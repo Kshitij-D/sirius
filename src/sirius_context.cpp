@@ -52,6 +52,7 @@
 #include <cudf/utilities/pinned_memory.hpp>
 
 #include <rmm/cuda_device.hpp>
+#include <rmm/mr/cuda_async_memory_resource.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -225,6 +226,7 @@ SiriusContext::SiriusContext() = default;
 
 SiriusContext::~SiriusContext() noexcept
 {
+  stop_memlog();  // the sampler reads the memory manager; join it before anything is torn down
   // terminate() may throw during database teardown; a noexcept destructor must contain it.
   if (!is_initialized_) {
     // A context that threw during initialize() may have installed the cuDF
@@ -1237,11 +1239,73 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
 
   is_initialized_           = true;
   pinned_rollback.dismissed = true;
+  start_memlog_if_requested();
+}
+
+void SiriusContext::start_memlog_if_requested()
+{
+  auto const* path = std::getenv("SIRIUS_MEMLOG");
+  if (path == nullptr || *path == '\0' || memlog_thread_.joinable()) { return; }
+  memlog_stop_.store(false);
+  memlog_thread_ = std::thread([this, file = std::string(path)] {
+    std::FILE* f = std::fopen(file.c_str(), "w");
+    if (f == nullptr) { return; }
+    std::fprintf(f,
+                 "t,gpu_alloc,gpu_reserved,host_alloc,pool_reserved,pool_used,drv_free,live,"
+                 "waiting,completed\n");
+    using namespace std::chrono;
+    while (!memlog_stop_.load(std::memory_order_relaxed)) {
+      double const t = duration<double>(system_clock::now().time_since_epoch()).count();
+      std::size_t alloc = 0, reserved = 0, host_alloc = 0;
+      std::uint64_t pool_reserved = 0, pool_used = 0;
+      for (auto const* sp : memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+        if (sp == nullptr) { continue; }
+        if (auto const* mr = sp->get_memory_resource_of<cucascade::memory::Tier::GPU>()) {
+          alloc += mr->get_total_allocated_bytes();
+          reserved += mr->get_total_reserved_bytes();
+          auto upstream = mr->get_upstream_resource();
+          if (auto* amr = ::cuda::mr::resource_cast<rmm::mr::cuda_async_memory_resource>(&upstream)) {
+            std::uint64_t r = 0, u = 0;
+            cudaMemPoolGetAttribute(amr->pool_handle(), cudaMemPoolAttrReservedMemCurrent, &r);
+            cudaMemPoolGetAttribute(amr->pool_handle(), cudaMemPoolAttrUsedMemCurrent, &u);
+            pool_reserved += r;
+            pool_used += u;
+          }
+        }
+      }
+      host_alloc = memory_manager_->get_total_reserved_memory_for_tier(cucascade::memory::Tier::HOST);
+      std::size_t drv_free = 0, drv_total = 0;
+      cudaMemGetInfo(&drv_free, &drv_total);
+      auto const c = admission_.snapshot();
+      std::fprintf(f,
+                   "%.4f,%zu,%zu,%zu,%llu,%llu,%zu,%zu,%zu,%llu\n",
+                   t,
+                   alloc,
+                   reserved,
+                   host_alloc,
+                   static_cast<unsigned long long>(pool_reserved),
+                   static_cast<unsigned long long>(pool_used),
+                   drv_free,
+                   c.active_queries,
+                   c.queued_queries,
+                   static_cast<unsigned long long>(c.completed_queries));
+      std::fflush(f);
+      std::this_thread::sleep_for(milliseconds(10));
+    }
+    std::fclose(f);
+  });
+}
+
+void SiriusContext::stop_memlog() noexcept
+{
+  memlog_stop_.store(true);
+  if (memlog_thread_.joinable()) { memlog_thread_.join(); }
 }
 
 void SiriusContext::terminate()
 {
   throw_if_not_initialized();
+  stop_memlog();
   admission_.close();
   mark_runtime_unavailable();
   admission_.wait_until_idle();

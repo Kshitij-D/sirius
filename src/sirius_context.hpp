@@ -48,6 +48,7 @@
 
 #include <array>
 #include <atomic>
+#include <thread>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -919,6 +920,12 @@ class SiriusContext : public ClientContextState {
 
   mutable std::mutex mutex_;
   sirius::exec::query_admission admission_;
+  // Experimental (env-gated, SIRIUS_MEMLOG): 10 ms sampler of cuCascade accounting, the CUDA pool
+  // and admission state, for the memory-accounting study.
+  void start_memlog_if_requested();
+  void stop_memlog() noexcept;
+  std::thread memlog_thread_;
+  std::atomic<bool> memlog_stop_{false};
   // See runtime_health: latched when a mandatory cleanup step fails.
   std::atomic<bool> runtime_unavailable_{false};
   bool is_initialized_ = false;
