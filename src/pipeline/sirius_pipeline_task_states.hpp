@@ -51,6 +51,7 @@ struct reservation_size_info {
   std::size_t retry_reservation_floor = 0;      ///< OOM-derived lower bound
   std::size_t reservation_size        = 0;      ///< max(normal estimate, retry floor)
   bool had_history                    = false;  ///< Estimate used pipeline history
+  std::size_t raw_peak_estimate       = 0;      ///< Estimate before SIRIUS_RESV_CALIB scaling
 };
 
 /**

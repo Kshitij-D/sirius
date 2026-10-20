@@ -53,6 +53,7 @@
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
+#include "data/convertible_data_batch.hpp"
 
 #include <cuda_runtime_api.h>
 
@@ -1250,6 +1251,24 @@ void SiriusContext::start_memlog_if_requested()
   memlog_thread_ = std::thread([this, file = std::string(path)] {
     std::FILE* f = std::fopen(file.c_str(), "w");
     if (f == nullptr) { return; }
+    // SIRIUS_HELDLOG: every 10th sample (100 ms), bytes each live query holds in its data
+    // repositories (intermediates published between pipelines), per tier. A work lease is taken
+    // per query so its repositories cannot be torn down mid-walk; a query that is retiring is
+    // skipped.
+    std::FILE* hf = nullptr;
+    if (auto const* hp = std::getenv("SIRIUS_HELDLOG"); hp != nullptr && *hp != '\0') {
+      hf = std::fopen(hp, "w");
+      if (hf != nullptr) { std::fprintf(hf, "t,query_id,held_gpu,held_host,repos\n"); }
+    }
+    cucascade::memory::memory_space* gpu_space  = nullptr;
+    cucascade::memory::memory_space* host_space = nullptr;
+    for (auto* sp : memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+      if (sp != nullptr) { gpu_space = const_cast<cucascade::memory::memory_space*>(sp); break; }
+    }
+    for (auto* sp : memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST)) {
+      if (sp != nullptr) { host_space = const_cast<cucascade::memory::memory_space*>(sp); break; }
+    }
+    std::uint64_t sample_no = 0;
     std::fprintf(f,
                  "t,gpu_alloc,gpu_reserved,host_alloc,pool_reserved,pool_used,drv_free,live,"
                  "waiting,completed\n");
@@ -1290,9 +1309,27 @@ void SiriusContext::start_memlog_if_requested()
                    c.queued_queries,
                    static_cast<unsigned long long>(c.completed_queries));
       std::fflush(f);
+      if (hf != nullptr && (sample_no++ % 10) == 0) {
+        for (auto const& [qid, manager] : data_repository_registry_.candidates()) {
+          auto lease = query_lifecycle_.try_acquire_work(qid);
+          if (!lease || !manager) { continue; }
+          std::size_t g = 0, h = 0, n = 0;
+          for (auto* repo : manager->get_repositories()) {
+            if (repo == nullptr) { continue; }
+            sirius::convertible_data_batch_provider provider(repo);
+            if (gpu_space) { g += provider.get_bytes_in_space(gpu_space); }
+            if (host_space) { h += provider.get_bytes_in_space(host_space); }
+            ++n;
+          }
+          std::fprintf(hf, "%.4f,%llu,%zu,%zu,%zu\n", t,
+                       static_cast<unsigned long long>(sirius::value_of(qid)), g, h, n);
+        }
+        std::fflush(hf);
+      }
       std::this_thread::sleep_for(milliseconds(10));
     }
     std::fclose(f);
+    if (hf != nullptr) { std::fclose(hf); }
   });
 }
 

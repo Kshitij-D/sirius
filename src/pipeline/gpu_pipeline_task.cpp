@@ -46,6 +46,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <algorithm>
+#include <vector>
+#include <unordered_map>
 #include <format>
 #include <limits>
 #include <optional>
@@ -63,6 +66,73 @@ namespace {
 // the failure: requested bytes, cuCascade global usage, pool reserved vs used, driver free memory
 // and the cuCascade error kind.
 thread_local std::chrono::system_clock::time_point t_task_start{};
+
+
+// Experimental (env-gated, SIRIUS_RESV_CALIB=<quantile in (0,1]>): calibrated reservations.
+// Per operator chain, keep the last 256 ratios (real net peak / raw estimate) of completed tasks;
+// once a chain has 8 samples, scale new raw estimates by the chosen quantile of those ratios,
+// clamped to [0.02, 1] so calibration only removes padding and never inflates. The OOM-derived
+// retry floor still applies, so a task that overran retries with a larger reservation.
+double resv_calib_quantile()
+{
+  static double const q = [] {
+    auto const* v = std::getenv("SIRIUS_RESV_CALIB");
+    double x      = v ? std::atof(v) : 0.0;
+    return (x > 0.0 && x <= 1.0) ? x : 0.0;
+  }();
+  return q;
+}
+
+struct resv_calib_table {
+  std::mutex mutex;
+  std::unordered_map<std::string, std::vector<double>> ratios;  // ring of last 256 per chain
+  std::unordered_map<std::string, std::size_t> next;
+};
+
+resv_calib_table& resv_calib() { static resv_calib_table t; return t; }
+
+template <typename PipelinePtr>
+std::string ops_signature(PipelinePtr const& pipeline)
+{
+  std::string sig;
+  if (!pipeline) { return sig; }
+  for (auto& op_ref : pipeline->get_operators()) {
+    if (!sig.empty()) { sig += '>'; }
+    sig += op_ref.get().get_name();
+  }
+  return sig;
+}
+
+void resv_calib_record(std::string const& sig, std::size_t raw_estimate, std::size_t peak)
+{
+  if (resv_calib_quantile() == 0.0 || raw_estimate == 0 || sig.empty()) { return; }
+  double const r = static_cast<double>(peak) / static_cast<double>(raw_estimate);
+  auto& t        = resv_calib();
+  std::lock_guard<std::mutex> lock(t.mutex);
+  auto& v = t.ratios[sig];
+  if (v.size() < 256) {
+    v.push_back(r);
+  } else {
+    v[t.next[sig]++ % 256] = r;
+  }
+}
+
+double resv_calib_factor(std::string const& sig)
+{
+  double const q = resv_calib_quantile();
+  if (q == 0.0 || sig.empty()) { return 1.0; }
+  auto& t = resv_calib();
+  std::vector<double> v;
+  {
+    std::lock_guard<std::mutex> lock(t.mutex);
+    auto it = t.ratios.find(sig);
+    if (it == t.ratios.end() || it->second.size() < 8) { return 1.0; }
+    v = it->second;
+  }
+  auto k = static_cast<std::size_t>(q * static_cast<double>(v.size() - 1));
+  std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(k), v.end());
+  return std::clamp(v[k], 0.02, 1.0);
+}
 
 std::string const& tasklog_path()
 {
@@ -975,6 +1045,9 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
       // units and must not affect the aggregate ratio.
       bool const ratio_eligible = local_state._start_operator_index == 0;
       global.get_memory_history().record({input_basis, peak_bytes, output_bytes, ratio_eligible});
+      if (auto const& ri = local_state.get_reservation_size_info(); ri && ratio_eligible) {
+        resv_calib_record(ops_signature(pipeline), ri->raw_peak_estimate, static_cast<std::size_t>(peak_bytes));
+      }
       tasklog_write(pipeline,
                     _task_id,
                     local_state.get_reservation_size_info(),
@@ -1093,6 +1166,12 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
       (max_estimate > 0) ? max_estimate : memory::saturating_mul(input_basis, 2);
   }
 
+  info.raw_peak_estimate = info.peak_memory_estimate;
+  if (resv_calib_quantile() > 0.0) {
+    double const f = resv_calib_factor(ops_signature(gs.get_pipeline()));
+    info.peak_memory_estimate =
+      static_cast<std::size_t>(static_cast<double>(info.peak_memory_estimate) * f);
+  }
   auto const normal_reservation =
     memory::saturating_add(info.peak_memory_estimate, bytes_to_materialize);
   info.reservation_size = std::max(normal_reservation, info.retry_reservation_floor);
