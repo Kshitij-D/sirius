@@ -15,6 +15,7 @@
  */
 
 #include "sirius_engine.hpp"
+#include "pipeline/sched_policy.hpp"
 
 #include "cuda/device_health.hpp"
 #include "duckdb/execution/execution_context.hpp"
@@ -272,6 +273,11 @@ void sirius_engine::execute()
   auto future                          = completion_handler_->get_awaitable();
 
   plan_users_quiescent_ = false;
+  sched::query_begin(sirius::value_of(query_id_), context.GetCurrentQuery());
+  struct sched_query_guard {
+    std::size_t id;
+    ~sched_query_guard() { sched::query_end(id); }
+  } const sched_guard{sirius::value_of(query_id_)};
   // Create the query with the pipelines. It is owned here, alongside the plan it indexes.
   try {
     query_ = sirius_ctx->create_query(std::move(new_scheduled),
@@ -283,6 +289,7 @@ void sirius_engine::execute()
                                         .query_id           = query_id_,
                                       },
                                       [&client = context] { return client.IsInterrupted(); });
+    sched::query_admit_wait(sirius::value_of(query_id_), [&client = context] { return client.IsInterrupted(); });
     sirius_ctx->get_task_scheduler().start_query(*query_);
     sirius_ctx->get_scan_manager().run_preparation_on_query_thread(query_id_);
   } catch (...) {

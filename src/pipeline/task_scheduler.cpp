@@ -15,6 +15,7 @@
  */
 
 #include "pipeline/task_scheduler.hpp"
+#include "pipeline/sched_policy.hpp"
 
 #include "creator/task_creator.hpp"
 #include "downgrade/downgrade_executor.hpp"
@@ -320,14 +321,17 @@ void task_scheduler::management_eventloop()
       // One atomic selection across exact and unbound affinity, ordered by query/pipeline
       // priority. Delayed memory/lock retries yield to other compatible runnable work.
       const auto now = std::chrono::steady_clock::now();
+      bool policy_blocked = false;
       task =
         _task_queue
           .try_pop_if([&](auto const& candidate) {
             const auto keys = index_keys_for(candidate);
             return (keys.device_id == device_id || keys.device_id == exec::no_preferred_device) &&
-                   candidate.retry_not_before <= now;
+                   candidate.retry_not_before <= now &&
+                   sched::task_may_dispatch(candidate, policy_blocked);
           })
           .value_or(nullptr);
+      if (task) { sched::on_task_dispatched(*task); }
       if (!task) {
         if (_task_creator) { _task_creator->schedule_lookahead(device_id); }
         // No dispatchable task for this device. Leave device in _ready_devices

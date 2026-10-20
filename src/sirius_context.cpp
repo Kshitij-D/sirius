@@ -18,6 +18,7 @@
 
 #include "config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
+#include "pipeline/sched_policy.hpp"
 #include "cuda/device_health.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "duckdb/common/helper.hpp"
@@ -1228,6 +1229,11 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   // has been constructed.
   for (auto& executor : downgrade_executors_) {
     executor->set_pipeline_task_queue(task_scheduler_->get_pipeline_task_queue());
+  }
+
+  if (auto gpus = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+      !gpus.empty()) {
+    sirius::sched::bind_gpu_space(gpus.front());
   }
 
   // Start everything -- downgrade executors deferred until now

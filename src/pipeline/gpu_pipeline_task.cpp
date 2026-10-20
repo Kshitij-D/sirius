@@ -15,6 +15,7 @@
  */
 
 #include "pipeline/gpu_pipeline_task.hpp"
+#include "pipeline/sched_policy.hpp"
 
 #include "cuda/device_health.hpp"
 #include "cudf/cudf_utils.hpp"
@@ -631,6 +632,7 @@ gpu_pipeline_task::gpu_pipeline_task(
 
 gpu_pipeline_task::~gpu_pipeline_task()
 {
+  sched::on_task_released(*this);
   for (const auto& weak_batch : _subscribed_batches) {
     auto batch = weak_batch.lock();
     if (!batch) { continue; }
@@ -1093,6 +1095,10 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
         resv_calib_record(ops_signature(pipeline), ri->raw_peak_estimate, static_cast<std::size_t>(peak_bytes));
       }
       resv_p80_record(stage_key(pipeline), static_cast<std::size_t>(peak_bytes));
+      sched::on_task_completed(*this, input_basis,
+                               static_cast<std::size_t>(peak_bytes) +
+                                 local_state.get_reservation_size_info()->bytes_to_materialize_input,
+                               ratio_eligible);
       tasklog_write(pipeline,
                     _task_id,
                     local_state.get_reservation_size_info(),
@@ -1223,6 +1229,11 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
   auto const normal_reservation =
     memory::saturating_add(info.peak_memory_estimate, bytes_to_materialize);
   info.reservation_size = std::max(normal_reservation, info.retry_reservation_floor);
+  // Policy experiments (sched_policy.hpp): the policy gates memory, so the reservation covers
+  // only input materialization; growth is checked against the real pool (SIRIUS_BORROW).
+  if (sched::minimal_reservations()) {
+    info.reservation_size = std::max(bytes_to_materialize, info.retry_reservation_floor);
+  }
   return info;
 }
 

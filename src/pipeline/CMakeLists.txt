@@ -4,6 +4,7 @@ target_sources(
           gpu_pipeline_task.cpp
           sirius_pipeline_itask.cpp
           task_scheduler.cpp
+          sched_policy.cpp
           sirius_meta_pipeline.cpp
           sirius_pipeline.cpp
           sirius_pipeline_converter.cpp

@@ -115,6 +115,11 @@ class itask {
   // deadline prevents the oldest waiting task from monopolizing every dispatch opportunity.
   std::chrono::steady_clock::time_point retry_not_before{};
   memory::reservation_wait memory_wait;
+  // Experimental scheduling policy state (pipeline/sched_policy.hpp): grant held while dispatched,
+  // last prediction made by the dispatch predicate, and dispatch time.
+  std::size_t sched_grant = 0;
+  mutable std::size_t sched_pred = 0;
+  std::chrono::steady_clock::time_point sched_start{};
   exec::query_lifecycle_registry::memory_wait_guard memory_wait_activity;
 
   // Execution function.

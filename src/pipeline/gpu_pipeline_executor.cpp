@@ -15,6 +15,7 @@
  */
 
 #include "pipeline/gpu_pipeline_executor.hpp"
+#include "pipeline/sched_policy.hpp"
 
 #include "creator/task_creator.hpp"
 #include "cucascade/memory/stream_pool.hpp"
@@ -315,6 +316,7 @@ void gpu_pipeline_executor::process_task(
         _next_reclamation    = now + std::chrono::milliseconds(50);
       }
       pipeline_task->retry_not_before = pipeline_task->memory_wait.retry_at();
+      sched::on_task_released(*pipeline_task);
       if (!_task_creator) { throw std::logic_error("GPU retry requires a task creator"); }
       _task_creator->reschedule(std::move(pipeline_task));
       return;  // releases the reserved worker slot
