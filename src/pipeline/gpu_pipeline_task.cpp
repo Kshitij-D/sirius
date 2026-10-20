@@ -1098,7 +1098,7 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
       sched::on_task_completed(*this, input_basis,
                                static_cast<std::size_t>(peak_bytes) +
                                  local_state.get_reservation_size_info()->bytes_to_materialize_input,
-                               ratio_eligible);
+                               output_bytes, ratio_eligible);
       tasklog_write(pipeline,
                     _task_id,
                     local_state.get_reservation_size_info(),

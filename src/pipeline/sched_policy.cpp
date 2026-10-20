@@ -39,6 +39,7 @@ policy_kind parse_policy() noexcept
   if (s == "rapids") { return policy_kind::rapids; }
   if (s == "multiqx") { return policy_kind::multiqx; }
   if (s == "sauron") { return policy_kind::sauron; }
+  if (s == "sauron2") { return policy_kind::sauron2; }
   return policy_kind::upstream;
 }
 
@@ -48,8 +49,15 @@ char const* policy_name(policy_kind k) noexcept
     case policy_kind::rapids: return "rapids";
     case policy_kind::multiqx: return "multiqx";
     case policy_kind::sauron: return "sauron";
+    case policy_kind::sauron2: return "sauron2";
     default: return "upstream";
   }
+}
+
+double env_double(char const* name, double dflt) noexcept
+{
+  auto const* v = std::getenv(name);
+  return (v != nullptr && *v != '\0') ? std::strtod(v, nullptr) : dflt;
 }
 
 std::size_t env_size(char const* name, std::size_t dflt) noexcept
@@ -104,8 +112,35 @@ bool ids_of(parallel::itask const& t, task_ids& out) noexcept
   return true;
 }
 
+// Whether a ready task's source is a scan of a resident table (its input is not freed when it completes).
+struct task_inputs {
+  std::size_t upload = 0;
+  bool resident_scan = false;
+};
+
+task_inputs inputs_of(parallel::itask const& t) noexcept
+{
+  task_inputs r;
+  auto const* g = dynamic_cast<pipeline::gpu_pipeline_task const*>(&t);
+  if (g == nullptr || g->get_pipeline() == nullptr) { return r; }
+  r.resident_scan = g->get_pipeline()->get_source_operator().second ==
+                    op::SiriusPhysicalOperatorType::TABLE_SCAN;
+  // Upload bytes are not read here: that takes batch locks while the scheduler holds the queue
+  // lock (lock-order risk with the downgrade executor). The class footprint ratio already covers it.
+  return r;
+}
+
+// Per (query shape, pipeline) class: recent peak/input ratios (exact across instances), and
+// moving averages of output/input and seconds per input byte.
+struct class_stats {
+  std::deque<double> peak_ratio;
+  double out_ratio    = -1;
+  double sec_per_byte = -1;
+};
+
 struct running_query {
   std::size_t fp       = 0;
+  double done_sec      = 0;  // sauron2: task seconds completed so far
   std::size_t demand   = 0;  // multiqx: admitted weighted demand
   double weighted_sum  = 0;  // sum(duration * footprint)
   double duration_sum  = 0;
@@ -128,7 +163,21 @@ struct state {
   std::unordered_map<std::size_t, std::size_t> qx_demand;          // multiqx: fingerprint -> demand
   std::unordered_map<std::string, std::deque<std::size_t>> stage;  // rapids: "qid:pid" -> footprints
   std::unordered_map<std::string, std::vector<std::size_t>> stage_active;
-  std::unordered_map<std::string, std::deque<double>> cls;         // sauron: "fp:pid" -> footprint/basis
+  std::unordered_map<std::string, class_stats> cls;                // sauron*: "fp:pid" -> stats
+  std::unordered_map<std::size_t, double> shape_work;              // sauron2: fp -> task seconds per query
+  cucascade::memory::memory_space const* host = nullptr;
+
+  // sauron2 feedback limit on running tasks.
+  std::size_t k = 0, k_max = 0, max_running_win = 0;
+  int dir = +1;
+  clock::time_point win_start{};
+  double win_bytes = 0, prev_rate = -1;
+  std::FILE* log = nullptr;
+
+  // sauron2 selection scan.
+  std::size_t scan_pool_used = 0;
+  parallel::itask const* best = nullptr;
+  double best_score = 0;
 
   std::atomic<std::uint64_t> holds{0}, dispatches{0}, qholds{0};
   bool announced = false;
@@ -199,8 +248,8 @@ std::size_t rapids_estimate(state& s, task_ids const& id)
 std::size_t sauron_predict(state& s, task_ids const& id)
 {
   auto const it = s.cls.find(class_key(s, id));
-  if (it == s.cls.end() || it->second.empty()) { return 2 * id.basis; }
-  double const r = *std::max_element(it->second.begin(), it->second.end());
+  if (it == s.cls.end() || it->second.peak_ratio.empty()) { return 2 * id.basis; }
+  double const r = *std::max_element(it->second.peak_ratio.begin(), it->second.peak_ratio.end());
   return static_cast<std::size_t>(r * static_cast<double>(std::max<std::size_t>(id.basis, 1)));
 }
 
@@ -221,6 +270,125 @@ bool minimal_reservations() noexcept { return S().kind != policy_kind::upstream;
 void bind_gpu_space(cucascade::memory::memory_space const* space) noexcept
 {
   if (S().gpu == nullptr) { S().gpu = space; }
+}
+
+void bind_host_space(cucascade::memory::memory_space const* space) noexcept
+{
+  if (S().host == nullptr) { S().host = space; }
+}
+
+bool policy_selects() noexcept { return S().kind == policy_kind::sauron2; }
+
+namespace {
+
+// Hill-climb K on completed input bytes per second over ~1 s windows. K moves only when it was
+// binding (some instant had K tasks running); a drop in rate reverses direction. The host tier
+// nearing full means spill is about to reach disk, so K is cut regardless of rate.
+void update_k(state& s, clock::time_point now)
+{
+  if (s.k == 0) {
+    s.k_max     = std::max<std::size_t>(1, env_size("SIRIUS_POL_KMAX", 16));
+    s.k         = std::min(s.k_max, std::max<std::size_t>(1, env_size("SIRIUS_POL_K0", 4)));
+    s.win_start = now;
+    if (auto const* p = std::getenv("SIRIUS_SCHEDLOG"); p != nullptr && *p != '\0') {
+      s.log = std::fopen(p, "w");
+      if (s.log) { std::fprintf(s.log, "t,k,rate,prev_rate,max_running,host_frac,pool_used,granted\n"); }
+    }
+  }
+  double const dt = std::chrono::duration<double>(now - s.win_start).count();
+  if (dt < 1.0) { return; }
+  double const rate = s.win_bytes / dt;
+  double host_frac  = 0;
+  if (s.host != nullptr && s.host->get_max_memory() > 0) {
+    host_frac = static_cast<double>(s.host->get_total_reserved_memory()) /
+                static_cast<double>(s.host->get_max_memory());
+  }
+  double const eps = env_double("SIRIUS_POL_EPS", 0.03);
+  if (host_frac >= env_double("SIRIUS_POL_HOST_BRAKE", 0.9)) {
+    s.dir = -1;
+    if (s.k > 1) { --s.k; }
+  } else if (s.max_running_win >= s.k && s.win_bytes > 0) {
+    if (s.prev_rate > 0 && rate < s.prev_rate * (1 - eps)) { s.dir = -s.dir; }
+    if (s.dir > 0 && s.k < s.k_max) { ++s.k; }
+    if (s.dir < 0 && s.k > 1) { --s.k; }
+  }
+  if (s.log) {
+    std::fprintf(s.log, "%.3f,%zu,%.0f,%.0f,%zu,%.3f,%zu,%zu\n",
+                 std::chrono::duration<double>(now.time_since_epoch()).count(), s.k, rate, s.prev_rate,
+                 s.max_running_win, host_frac, s.scan_pool_used, s.granted);
+    std::fflush(s.log);
+  }
+  if (s.win_bytes > 0) { s.prev_rate = rate; }
+  s.win_bytes       = 0;
+  s.max_running_win = s.running;
+  s.win_start       = now;
+}
+
+}  // namespace
+
+void scan_begin() noexcept
+{
+  auto& s = S();
+  std::lock_guard lk(s.mu);
+  announce(s);
+  update_k(s, clock::now());
+  s.max_running_win = std::max(s.max_running_win, s.running);
+  s.scan_pool_used  = pool_used(s);
+  s.best            = nullptr;
+}
+
+void scan_consider(parallel::itask const& task) noexcept
+{
+  auto& s = S();
+  task_ids id;
+  if (!ids_of(task, id)) { return; }
+  auto const in = inputs_of(task);
+  std::lock_guard lk(s.mu);
+  if (s.running >= s.k) { return; }
+  auto const pred = sauron_predict(s, id);
+  auto const lim  = limit_bytes(s);
+  if (s.running > 0 && s.scan_pool_used + s.granted + pred > lim) {
+    s.holds.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  task.sched_pred = pred;
+  double const pressure =
+    lim > 0 ? static_cast<double>(s.scan_pool_used + s.granted) / static_cast<double>(lim) : 0;
+  double score = 0;
+  if (pressure >= env_double("SIRIUS_POL_PRESSURE", 0.9)) {
+    // Largest persistent release first: consumed input (not for resident scans) minus output.
+    auto const c       = s.cls.find(class_key(s, id));
+    double const out   = (c != s.cls.end() && c->second.out_ratio >= 0)
+                           ? c->second.out_ratio * static_cast<double>(id.basis)
+                           : static_cast<double>(id.basis);
+    double const freed = in.resident_scan ? 0.0 : static_cast<double>(id.basis);
+    score              = -(freed - out) + static_cast<double>(in.upload);
+  } else {
+    // Least predicted remaining work first (shortest-remaining-processing-time on queries).
+    double rem = 0;
+    if (auto q = s.queries.find(id.query_id); q != s.queries.end()) {
+      double total = 0;
+      if (auto w = s.shape_work.find(q->second.fp); w != s.shape_work.end()) {
+        total = w->second;
+      } else if (!s.shape_work.empty()) {
+        for (auto const& [f, v] : s.shape_work) { total += v; }
+        total /= static_cast<double>(s.shape_work.size());
+      }
+      rem = std::max(0.0, total - q->second.done_sec);
+    }
+    score = rem;
+  }
+  if (s.best == nullptr || score < s.best_score) {  // strict: ties keep priority order
+    s.best       = &task;
+    s.best_score = score;
+  }
+}
+
+parallel::itask const* scan_best() noexcept
+{
+  auto& s = S();
+  std::lock_guard lk(s.mu);
+  return s.best;
 }
 
 bool task_may_dispatch(parallel::itask const& task, bool& scan_blocked) noexcept
@@ -285,6 +453,7 @@ void on_task_released(parallel::itask& task) noexcept
 void on_task_completed(parallel::itask const& task,
                        std::size_t input_basis,
                        std::size_t footprint,
+                       std::size_t output_bytes,
                        bool ratio_eligible) noexcept
 {
   auto& s = S();
@@ -296,12 +465,19 @@ void on_task_completed(parallel::itask const& task,
     auto& h = s.stage[stage_key(id)];
     h.push_back(footprint);
     if (h.size() > 200) { h.pop_front(); }
-  } else if (s.kind == policy_kind::sauron) {
+  } else if (s.kind == policy_kind::sauron || s.kind == policy_kind::sauron2) {
+    double const sec = std::chrono::duration<double>(clock::now() - task.sched_start).count();
     if (ratio_eligible && input_basis > 0) {
-      auto& h = s.cls[class_key(s, id)];
-      h.push_back(static_cast<double>(footprint) / static_cast<double>(input_basis));
-      if (h.size() > 8) { h.pop_front(); }
+      auto& c = s.cls[class_key(s, id)];
+      double const b = static_cast<double>(input_basis);
+      c.peak_ratio.push_back(static_cast<double>(footprint) / b);
+      if (c.peak_ratio.size() > 8) { c.peak_ratio.pop_front(); }
+      double const o = static_cast<double>(output_bytes) / b;
+      c.out_ratio    = c.out_ratio < 0 ? o : 0.75 * c.out_ratio + 0.25 * o;
+      c.sec_per_byte = c.sec_per_byte < 0 ? sec / b : 0.75 * c.sec_per_byte + 0.25 * sec / b;
     }
+    if (auto it = s.queries.find(id.query_id); it != s.queries.end()) { it->second.done_sec += sec; }
+    s.win_bytes += static_cast<double>(input_basis);
   } else if (s.kind == policy_kind::multiqx) {
     if (auto it = s.queries.find(id.query_id); it != s.queries.end()) {
       double const d =
@@ -360,6 +536,10 @@ void query_end(std::size_t query_id) noexcept
     std::lock_guard lk(s.mu);
     auto it = s.queries.find(query_id);
     if (it != s.queries.end()) {
+      if (s.kind == policy_kind::sauron2 && it->second.done_sec > 0) {
+        auto& w = s.shape_work[it->second.fp];
+        w       = w <= 0 ? it->second.done_sec : 0.5 * w + 0.5 * it->second.done_sec;
+      }
       if (s.kind == policy_kind::multiqx && it->second.duration_sum > 0) {
         s.qx_demand[it->second.fp] =
           static_cast<std::size_t>(it->second.weighted_sum / it->second.duration_sum);

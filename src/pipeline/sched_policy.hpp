@@ -8,6 +8,12 @@
  *                       head-of-line blocking (no backfill); permits are never reconciled with the pool.
  *   multiqx             MultiQx-GPU (PVLDB 2014) admission: a query is delayed while its time-weighted
  *                       device-memory demand exceeds capacity minus the demands of running queries.
+ *   sauron2             sauron plus (a) a feedback limit K on running tasks, hill-climbed on the input
+ *                       bytes completed per second and cut when the host tier nears full (the disk cliff);
+ *                       (b) selection over the whole ready set instead of the first fit: under memory
+ *                       pressure the task with the largest predicted persistent release (consumed input
+ *                       minus predicted output) runs first; otherwise the task of the query with the
+ *                       least predicted remaining work (per-shape total task time minus work done) runs.
  *   sauron              operator-level packing: a task runs only if its predicted peak (exact per-class
  *                       peak/input ratio x the task's real input size) fits the real free pool after the
  *                       outstanding predicted peaks of running tasks; first fit in priority order.
@@ -34,15 +40,23 @@ class itask;
 
 namespace sirius::sched {
 
-enum class policy_kind { upstream, rapids, multiqx, sauron };
+enum class policy_kind { upstream, rapids, multiqx, sauron, sauron2 };
 
 policy_kind active_policy() noexcept;
 
 /// True when reservations should cover only input materialization (policy gates memory instead).
 bool minimal_reservations() noexcept;
 
-/// Called once by the runtime with the first GPU memory space.
+/// Called once by the runtime with the first GPU and first HOST memory spaces.
 void bind_gpu_space(const cucascade::memory::memory_space* space) noexcept;
+void bind_host_space(const cucascade::memory::memory_space* space) noexcept;
+
+/// sauron2 chooses among all dispatchable tasks: the scheduler calls scan_begin, scan_consider on
+/// each candidate that passes device/retry checks, then pops scan_best (nullptr = hold all).
+bool policy_selects() noexcept;
+void scan_begin() noexcept;
+void scan_consider(const parallel::itask& task) noexcept;
+const parallel::itask* scan_best() noexcept;
 
 /// Scheduler predicate hook, evaluated per candidate in priority order inside one selection scan.
 /// `scan_blocked` is per-scan state for head-of-line blocking; start each scan with false.
@@ -58,6 +72,7 @@ void on_task_released(parallel::itask& task) noexcept;
 void on_task_completed(const parallel::itask& task,
                        std::size_t input_basis,
                        std::size_t footprint,
+                       std::size_t output_bytes,
                        bool ratio_eligible) noexcept;
 
 /// Query lifecycle (all policies record; only multiqx blocks in query_admit_wait).

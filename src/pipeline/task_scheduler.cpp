@@ -322,15 +322,32 @@ void task_scheduler::management_eventloop()
       // priority. Delayed memory/lock retries yield to other compatible runnable work.
       const auto now = std::chrono::steady_clock::now();
       bool policy_blocked = false;
-      task =
-        _task_queue
-          .try_pop_if([&](auto const& candidate) {
-            const auto keys = index_keys_for(candidate);
-            return (keys.device_id == device_id || keys.device_id == exec::no_preferred_device) &&
-                   candidate.retry_not_before <= now &&
-                   sched::task_may_dispatch(candidate, policy_blocked);
-          })
-          .value_or(nullptr);
+      auto eligible       = [&](auto const& candidate) {
+        const auto keys = index_keys_for(candidate);
+        return (keys.device_id == device_id || keys.device_id == exec::no_preferred_device) &&
+               candidate.retry_not_before <= now;
+      };
+      if (sched::policy_selects()) {
+        sched::scan_begin();
+        (void)_task_queue.try_pop_if([&](auto const& candidate) {
+          if (eligible(candidate)) { sched::scan_consider(candidate); }
+          return false;
+        });
+        auto const* best = sched::scan_best();
+        if (best != nullptr) {
+          task = _task_queue
+                   .try_pop_if([&](auto const& candidate) {
+                     return &candidate == best && eligible(candidate);
+                   })
+                   .value_or(nullptr);
+        }
+      } else {
+        task = _task_queue
+                 .try_pop_if([&](auto const& candidate) {
+                   return eligible(candidate) && sched::task_may_dispatch(candidate, policy_blocked);
+                 })
+                 .value_or(nullptr);
+      }
       if (task) { sched::on_task_dispatched(*task); }
       if (!task) {
         if (_task_creator) { _task_creator->schedule_lookahead(device_id); }

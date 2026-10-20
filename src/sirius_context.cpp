@@ -1235,6 +1235,10 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
       !gpus.empty()) {
     sirius::sched::bind_gpu_space(gpus.front());
   }
+  if (auto hosts = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+      !hosts.empty()) {
+    sirius::sched::bind_host_space(hosts.front());
+  }
 
   // Start everything -- downgrade executors deferred until now
   for (auto& executor : downgrade_executors_) {
