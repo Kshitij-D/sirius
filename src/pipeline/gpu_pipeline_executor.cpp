@@ -34,6 +34,10 @@
 #include "telemetry/telemetry_context.hpp"
 
 #include <rmm/cuda_device.hpp>
+#include <rmm/mr/cuda_async_memory_resource.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
+
+#include <cstdlib>
 
 #include <util/stream_check_wrapper.hpp>
 
@@ -47,6 +51,40 @@
 #include <string>
 #include <utility>
 namespace sirius {
+namespace {
+// Experimental (env-gated, SIRIUS_REAL_ADMIT=<margin>, e.g. 1.2): real-memory backpressure.
+// cuCascade grants a reservation from its own accounting, but tasks can overrun reservations, and a
+// pool full of running tasks' working memory then turns into OOM-retry storms. With this check, a
+// task whose request x margin exceeds the CUDA pool's real free bytes (reserved - used) is treated
+// like a refused reservation and goes through the existing memory-wait path, but only while other
+// reservations are active, so the GPU is never left idle and the wait cannot deadlock.
+double real_admit_margin()
+{
+  static double const m = [] {
+    auto const* v = std::getenv("SIRIUS_REAL_ADMIT");
+    double x      = v ? std::atof(v) : 0.0;
+    return x > 0.0 ? x : 0.0;
+  }();
+  return m;
+}
+
+bool real_admit_blocks(cucascade::memory::memory_space* space, std::size_t bytes)
+{
+  if (real_admit_margin() == 0.0 || space == nullptr) { return false; }
+  auto* mr = space->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+  if (mr == nullptr || mr->get_active_reservation_count() == 0) { return false; }
+  auto upstream = mr->get_upstream_resource();
+  auto* amr     = ::cuda::mr::resource_cast<rmm::mr::cuda_async_memory_resource>(&upstream);
+  if (amr == nullptr) { return false; }
+  std::uint64_t reserved = 0, used = 0;
+  if (cudaMemPoolGetAttribute(amr->pool_handle(), cudaMemPoolAttrReservedMemCurrent, &reserved) != cudaSuccess ||
+      cudaMemPoolGetAttribute(amr->pool_handle(), cudaMemPoolAttrUsedMemCurrent, &used) != cudaSuccess) {
+    return false;
+  }
+  auto const free_bytes = reserved > used ? reserved - used : 0;
+  return static_cast<double>(free_bytes) < real_admit_margin() * static_cast<double>(bytes);
+}
+}  // namespace
 namespace pipeline {
 
 gpu_pipeline_executor::gpu_pipeline_executor(
@@ -228,7 +266,10 @@ void gpu_pipeline_executor::process_task(
       _memory_space->get_available_memory(),
       _memory_space->get_total_reserved_memory(),
       _memory_space->get_max_memory());
-    auto reservation = _memory_space->make_reservation_or_null(bytes_needs);
+    decltype(_memory_space->make_reservation_or_null(bytes_needs)) reservation{};
+    if (!real_admit_blocks(_memory_space, bytes_needs)) {
+      reservation = _memory_space->make_reservation_or_null(bytes_needs);
+    }
     if (!reservation || reservation->size() < bytes_needs) {
       reservation.reset();
       const auto now = std::chrono::steady_clock::now();
