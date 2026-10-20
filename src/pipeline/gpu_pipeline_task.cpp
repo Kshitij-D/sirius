@@ -134,6 +134,50 @@ double resv_calib_factor(std::string const& sig)
   return std::clamp(v[k], 0.02, 1.0);
 }
 
+
+// Experimental baseline (env-gated, SIRIUS_RESV_P80=1): Spark RAPIDS-style sizing. Per stage (query,
+// pipeline), reserve the 80th percentile of the net peaks of that stage's completed tasks; the first task
+// of a stage keeps the engine's raw estimate. Like RAPIDS, it learns only within the running query.
+bool resv_p80_enabled()
+{
+  static bool const on = [] {
+    auto const* v = std::getenv("SIRIUS_RESV_P80");
+    return v != nullptr && *v == '1';
+  }();
+  return on;
+}
+resv_calib_table& resv_p80() { static resv_calib_table t; return t; }
+template <typename PipelinePtr>
+std::string stage_key(PipelinePtr const& pipeline)
+{
+  if (!pipeline) { return {}; }
+  return std::to_string(sirius::value_of(pipeline->get_query_id())) + ":" +
+         std::to_string(static_cast<std::size_t>(pipeline->get_pipeline_id()));
+}
+void resv_p80_record(std::string const& key, std::size_t peak)
+{
+  if (!resv_p80_enabled() || key.empty()) { return; }
+  auto& t = resv_p80();
+  std::lock_guard<std::mutex> lock(t.mutex);
+  auto& v = t.ratios[key];
+  if (v.size() < 256) { v.push_back(static_cast<double>(peak)); } else { v[t.next[key]++ % 256] = static_cast<double>(peak); }
+}
+std::optional<std::size_t> resv_p80_estimate(std::string const& key)
+{
+  if (!resv_p80_enabled() || key.empty()) { return std::nullopt; }
+  auto& t = resv_p80();
+  std::vector<double> v;
+  {
+    std::lock_guard<std::mutex> lock(t.mutex);
+    auto it = t.ratios.find(key);
+    if (it == t.ratios.end() || it->second.empty()) { return std::nullopt; }
+    v = it->second;
+  }
+  auto k = static_cast<std::size_t>(0.8 * static_cast<double>(v.size() - 1));
+  std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(k), v.end());
+  return static_cast<std::size_t>(v[k]);
+}
+
 std::string const& tasklog_path()
 {
   static std::string const path = [] {
@@ -1048,6 +1092,7 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
       if (auto const& ri = local_state.get_reservation_size_info(); ri && ratio_eligible) {
         resv_calib_record(ops_signature(pipeline), ri->raw_peak_estimate, static_cast<std::size_t>(peak_bytes));
       }
+      resv_p80_record(stage_key(pipeline), static_cast<std::size_t>(peak_bytes));
       tasklog_write(pipeline,
                     _task_id,
                     local_state.get_reservation_size_info(),
@@ -1167,6 +1212,9 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
   }
 
   info.raw_peak_estimate = info.peak_memory_estimate;
+  if (auto p80 = resv_p80_estimate(stage_key(gs.get_pipeline())); p80.has_value()) {
+    info.peak_memory_estimate = *p80;
+  }
   if (resv_calib_quantile() > 0.0) {
     double const f = resv_calib_factor(ops_signature(gs.get_pipeline()));
     info.peak_memory_estimate =
