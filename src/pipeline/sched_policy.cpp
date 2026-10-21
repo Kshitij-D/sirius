@@ -623,6 +623,17 @@ void query_admit_wait(std::size_t query_id, std::function<bool()> const& interru
 void query_end(std::size_t query_id) noexcept
 {
   auto& s = S();
+  if (memory::ledger_enabled()) {
+    static std::atomic<std::uint64_t> n{0};
+    if (n.fetch_add(1) % 50 == 0) {
+      auto& d = D();
+      std::lock_guard lk(d.mu);
+      std::fprintf(stderr, "[ledger] queries_ended=%llu resident=%zu limit=%zu drains=%llu abandoned=%llu\n",
+                   static_cast<unsigned long long>(n.load()), memory::resident_bytes(s.gpu),
+                   limit_bytes(s), static_cast<unsigned long long>(d.drains),
+                   static_cast<unsigned long long>(d.abandoned));
+    }
+  }
   if (s.kind == policy_kind::upstream) { return; }
   {
     std::lock_guard lk(s.mu);
