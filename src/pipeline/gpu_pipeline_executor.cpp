@@ -255,6 +255,15 @@ void gpu_pipeline_executor::process_task(
         ? _memory_space->get_max_memory() -
             std::min(_memory_space->get_max_memory(), memory::resident_bytes(_memory_space))
         : _memory_space->get_max_memory();
+    // Ledger shrink: a task refused for longer than SIRIUS_LEDGER_SHRINK_MS (default 1000) asks
+    // only for what the accounting can grant now and borrows the rest from the real pool
+    // (SIRIUS_BORROW), instead of waiting for headroom that other work keeps consuming.
+    bool const ledger_shrink =
+      memory::ledger_enabled() && sched::ledger_should_shrink(*pipeline_task);
+    if (ledger_shrink) {
+      auto const headroom = memory::gpu_reservation_headroom(*_memory_space);
+      bytes_needs = std::min(bytes_needs, std::max<std::size_t>(headroom, std::size_t{1} << 20));
+    }
     if (auto const space_max = grantable; space_max > 0 && bytes_needs > space_max) {
       SIRIUS_LOG_DEBUG(
         "GPU Pipeline Executor: clamping reservation request {} -> {} bytes (space max) for "
@@ -276,7 +285,10 @@ void gpu_pipeline_executor::process_task(
       _memory_space->get_total_reserved_memory(),
       _memory_space->get_max_memory());
     decltype(_memory_space->make_reservation_or_null(bytes_needs)) reservation{};
-    if (!real_admit_blocks(_memory_space, bytes_needs)) {
+    if (ledger_shrink) {
+      // Bounded at the limit and never refused: the task runs on what accounting can grant now.
+      reservation = _memory_space->make_reservation_upto(bytes_needs);
+    } else if (!real_admit_blocks(_memory_space, bytes_needs)) {
       reservation = _memory_space->make_reservation_or_null(bytes_needs);
     }
     if (!reservation || reservation->size() < bytes_needs) {

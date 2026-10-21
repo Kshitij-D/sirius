@@ -456,12 +456,20 @@ void ledger_note_refusal(parallel::itask& task) noexcept
   if (task.sched_wait_since == clock::time_point{}) { task.sched_wait_since = now; }
   auto& d = D();
   std::lock_guard lk(d.mu);
-  if (d.owner == nullptr &&
-      now - task.sched_wait_since > std::chrono::milliseconds(env_size("SIRIUS_LEDGER_DRAIN_MS", 1000))) {
+  auto const drain_ms = env_size("SIRIUS_LEDGER_DRAIN_MS", 0);
+  if (drain_ms > 0 && d.owner == nullptr &&
+      now - task.sched_wait_since > std::chrono::milliseconds(drain_ms)) {
     d.owner = &task;
     d.since = now;
     ++d.drains;
   }
+}
+
+bool ledger_should_shrink(parallel::itask const& task) noexcept
+{
+  if (!memory::ledger_enabled() || task.sched_wait_since == clock::time_point{}) { return false; }
+  static auto const ms = std::chrono::milliseconds(env_size("SIRIUS_LEDGER_SHRINK_MS", 1000));
+  return clock::now() - task.sched_wait_since > ms;
 }
 
 void ledger_note_granted(parallel::itask& task) noexcept

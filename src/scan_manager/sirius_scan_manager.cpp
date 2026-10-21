@@ -15,6 +15,7 @@
  */
 
 #include "scan_manager/sirius_scan_manager.hpp"
+#include "memory/resident_ledger.hpp"
 
 #include "compression/decompression_pushdown_policy.hpp"
 #include "compression/device_compressed_blob.hpp"
@@ -2867,7 +2868,9 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
             continue;
           }
           entry.data_batches_by_column[std::string{column_names[i]}].emplace_back(
-            std::move(cols[i]));
+            sirius::memory::make_resident(
+              std::move(cols[i]),
+              chunk_memory_spaces.at(static_cast<std::size_t>(&table - data_tables.data()))));
         }
       }
       // Reflect the merged columns in cache_info so can_serve_with_columns'
@@ -2957,7 +2960,10 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
                                std::to_string(column_names.size()));
     }
     for (std::size_t i = 0; i < cols.size(); ++i) {
-      entry.data_batches_by_column[std::string{column_names[i]}].emplace_back(std::move(cols[i]));
+      entry.data_batches_by_column[std::string{column_names[i]}].emplace_back(
+        sirius::memory::make_resident(
+          std::move(cols[i]),
+          entry.chunk_memory_spaces.at(static_cast<std::size_t>(&table - data_tables.data()))));
     }
   }
 

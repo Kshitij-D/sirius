@@ -116,6 +116,31 @@ std::size_t resident_bytes(const cucascade::memory::memory_space* space) noexcep
   return it == entries().end() ? 0 : it->second->bytes.load(std::memory_order_relaxed);
 }
 
+std::shared_ptr<cudf::column> make_resident(std::unique_ptr<cudf::column> col,
+                                            const cucascade::memory::memory_space* space)
+{
+  if (!ledger_enabled() || space == nullptr || !col) { return std::shared_ptr<cudf::column>(std::move(col)); }
+  auto const bytes = col->alloc_size();
+  auto* counter    = &entry_for(space).bytes;
+  counter->fetch_add(bytes, std::memory_order_relaxed);
+  return std::shared_ptr<cudf::column>(col.release(), [counter, bytes](cudf::column* c) {
+    delete c;
+    counter->fetch_sub(bytes, std::memory_order_relaxed);
+  });
+}
+
+void add_resident(const cucascade::memory::memory_space* space, std::size_t bytes) noexcept
+{
+  if (!ledger_enabled() || space == nullptr || bytes == 0) { return; }
+  entry_for(space).bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void sub_resident(const cucascade::memory::memory_space* space, std::size_t bytes) noexcept
+{
+  if (!ledger_enabled() || space == nullptr || bytes == 0) { return; }
+  entry_for(space).bytes.fetch_sub(bytes, std::memory_order_relaxed);
+}
+
 const std::atomic<std::size_t>* resident_counter(const cucascade::memory::memory_space* space)
 {
   if (!ledger_enabled() || space == nullptr) { return nullptr; }
