@@ -260,6 +260,7 @@ void gpu_pipeline_executor::process_task(
     // (SIRIUS_BORROW), instead of waiting for headroom that other work keeps consuming.
     bool const ledger_shrink =
       memory::ledger_enabled() && sched::ledger_should_shrink(*pipeline_task);
+    auto const unshrunk_bytes = bytes_needs;
     if (ledger_shrink) {
       auto const headroom = memory::gpu_reservation_headroom(*_memory_space);
       bytes_needs = std::min(bytes_needs, std::max<std::size_t>(headroom, std::size_t{1} << 20));
@@ -288,6 +289,26 @@ void gpu_pipeline_executor::process_task(
     if (ledger_shrink) {
       // Bounded at the limit and never refused: the task runs on what accounting can grant now.
       reservation = _memory_space->make_reservation_upto(bytes_needs);
+      // Keep the spill signal a refusal would have sent: the shortfall must still be freed.
+      auto const now = std::chrono::steady_clock::now();
+      // Capped at what is grantable so the spill target is always reachable.
+      auto const want = std::min(unshrunk_bytes, grantable);
+      if (_pending_reclamation.valid() &&
+          _pending_reclamation.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        try {
+          _pending_reclamation.get();
+        } catch (...) {
+          if (_query_lifecycle.report_failure(std::current_exception(), query_id)) {
+            if (iteration_completion) iteration_completion->report_error(std::current_exception());
+            return;
+          }
+        }
+      }
+      if (want > bytes_needs && _downgrade_executor && !_pending_reclamation.valid() &&
+          now >= _next_reclamation) {
+        _pending_reclamation = _downgrade_executor->request_reservation_capacity(want);
+        _next_reclamation    = now + std::chrono::milliseconds(50);
+      }
     } else if (!real_admit_blocks(_memory_space, bytes_needs)) {
       reservation = _memory_space->make_reservation_or_null(bytes_needs);
     }
