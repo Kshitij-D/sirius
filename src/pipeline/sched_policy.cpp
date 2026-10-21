@@ -40,6 +40,7 @@ policy_kind parse_policy() noexcept
   if (s == "multiqx") { return policy_kind::multiqx; }
   if (s == "sauron") { return policy_kind::sauron; }
   if (s == "sauron2") { return policy_kind::sauron2; }
+  if (s == "sauron3") { return policy_kind::sauron3; }
   return policy_kind::upstream;
 }
 
@@ -50,6 +51,7 @@ char const* policy_name(policy_kind k) noexcept
     case policy_kind::multiqx: return "multiqx";
     case policy_kind::sauron: return "sauron";
     case policy_kind::sauron2: return "sauron2";
+    case policy_kind::sauron3: return "sauron3";
     default: return "upstream";
   }
 }
@@ -277,7 +279,10 @@ void bind_host_space(cucascade::memory::memory_space const* space) noexcept
   if (S().host == nullptr) { S().host = space; }
 }
 
-bool policy_selects() noexcept { return S().kind == policy_kind::sauron2; }
+bool policy_selects() noexcept
+{
+  return S().kind == policy_kind::sauron2 || S().kind == policy_kind::sauron3;
+}
 
 namespace {
 
@@ -351,18 +356,32 @@ void scan_consider(parallel::itask const& task) noexcept
     s.holds.fetch_add(1, std::memory_order_relaxed);
     return;
   }
+  auto const c_it    = s.cls.find(class_key(s, id));
+  double const out_b = (c_it != s.cls.end() && c_it->second.out_ratio >= 0)
+                         ? c_it->second.out_ratio * static_cast<double>(id.basis)
+                         : static_cast<double>(id.basis);
+  double const freed_b = in.resident_scan ? 0.0 : static_cast<double>(id.basis);
+  if (s.kind == policy_kind::sauron3 && s.running > 0 && out_b - freed_b > 0) {
+    // Persistent growth must fit the fast tiers: GPU headroom (limit minus real use and outstanding
+    // peaks) plus host-tier headroom, keeping a 10% host margin before the disk tier.
+    double gpu_head  = static_cast<double>(lim) - static_cast<double>(s.scan_pool_used + s.granted);
+    double host_head = 0;
+    if (s.host != nullptr) {
+      host_head = 0.9 * static_cast<double>(s.host->get_max_memory()) -
+                  static_cast<double>(s.host->get_total_reserved_memory());
+    }
+    if (out_b - freed_b > std::max(0.0, gpu_head) + std::max(0.0, host_head)) {
+      s.holds.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+  }
   task.sched_pred = pred;
   double const pressure =
     lim > 0 ? static_cast<double>(s.scan_pool_used + s.granted) / static_cast<double>(lim) : 0;
   double score = 0;
   if (pressure >= env_double("SIRIUS_POL_PRESSURE", 0.9)) {
     // Largest persistent release first: consumed input (not for resident scans) minus output.
-    auto const c       = s.cls.find(class_key(s, id));
-    double const out   = (c != s.cls.end() && c->second.out_ratio >= 0)
-                           ? c->second.out_ratio * static_cast<double>(id.basis)
-                           : static_cast<double>(id.basis);
-    double const freed = in.resident_scan ? 0.0 : static_cast<double>(id.basis);
-    score              = -(freed - out) + static_cast<double>(in.upload);
+    score = -(freed_b - out_b) + static_cast<double>(in.upload);
   } else {
     // Least predicted remaining work first (shortest-remaining-processing-time on queries).
     double rem = 0;
@@ -465,7 +484,8 @@ void on_task_completed(parallel::itask const& task,
     auto& h = s.stage[stage_key(id)];
     h.push_back(footprint);
     if (h.size() > 200) { h.pop_front(); }
-  } else if (s.kind == policy_kind::sauron || s.kind == policy_kind::sauron2) {
+  } else if (s.kind == policy_kind::sauron || s.kind == policy_kind::sauron2 ||
+             s.kind == policy_kind::sauron3) {
     double const sec = std::chrono::duration<double>(clock::now() - task.sched_start).count();
     if (ratio_eligible && input_basis > 0) {
       auto& c = s.cls[class_key(s, id)];
@@ -536,7 +556,8 @@ void query_end(std::size_t query_id) noexcept
     std::lock_guard lk(s.mu);
     auto it = s.queries.find(query_id);
     if (it != s.queries.end()) {
-      if (s.kind == policy_kind::sauron2 && it->second.done_sec > 0) {
+      if ((s.kind == policy_kind::sauron2 || s.kind == policy_kind::sauron3) &&
+          it->second.done_sec > 0) {
         auto& w = s.shape_work[it->second.fp];
         w       = w <= 0 ? it->second.done_sec : 0.5 * w + 0.5 * it->second.done_sec;
       }

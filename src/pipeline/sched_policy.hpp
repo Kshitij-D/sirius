@@ -8,6 +8,10 @@
  *                       head-of-line blocking (no backfill); permits are never reconciled with the pool.
  *   multiqx             MultiQx-GPU (PVLDB 2014) admission: a query is delayed while its time-weighted
  *                       device-memory demand exceeds capacity minus the demands of running queries.
+ *   sauron3             sauron2 plus a fast-tier working-set gate: a task whose predicted persistent
+ *                       growth (predicted output minus consumed input) is positive runs only while that
+ *                       growth fits in GPU headroom plus host-tier headroom, so held intermediates never
+ *                       have to spill to disk. Tasks that shrink the working set are never held by it.
  *   sauron2             sauron plus (a) a feedback limit K on running tasks, hill-climbed on the input
  *                       bytes completed per second and cut when the host tier nears full (the disk cliff);
  *                       (b) selection over the whole ready set instead of the first fit: under memory
@@ -40,7 +44,7 @@ class itask;
 
 namespace sirius::sched {
 
-enum class policy_kind { upstream, rapids, multiqx, sauron, sauron2 };
+enum class policy_kind { upstream, rapids, multiqx, sauron, sauron2, sauron3 };
 
 policy_kind active_policy() noexcept;
 
