@@ -15,6 +15,7 @@
  */
 
 #include "pin_table.hpp"
+#include "memory/resident_ledger.hpp"
 
 #include "compression/compressed_representation.hpp"
 #include "compression/device_compressed_blob.hpp"
@@ -312,7 +313,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     // ref and outlives the call.
     auto materialized = ingestible.materialize_metadata_to_table(
       *batch, *target, stream, false, nullptr, options.expression_policy);
-    auto tbl              = materialized.table.release(stream, target->get_default_allocator());
+    auto tbl              = materialized.table.release(stream, sirius::memory::resident_allocator(target));
     auto const chunk_rows = static_cast<std::size_t>(tbl->num_rows());
     validate_duckdb_pin_chunk(*batch, chunk_rows, rows_materialized);
     rows_materialized += chunk_rows;
@@ -325,7 +326,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     std::vector<bool> narrowed_columns(static_cast<std::size_t>(tbl->num_columns()), false);
     if (options.capture_chunk_stats && !pinned_column_types.empty()) {
       chunk_stats = scan_manager::compute_pinned_chunk_stats(
-        tbl->view(), pinned_column_types, stream, target->get_default_allocator());
+        tbl->view(), pinned_column_types, stream, sirius::memory::resident_allocator(target));
     }
     // Observe BEFORE narrowing: the proof is about values, and same-family
     // narrowing preserves them, so the native carriers are both cheaper to
@@ -351,7 +352,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
           exact_chunks[i].push_back(
             std::make_unique<cudf::column>(tbl->view().column(static_cast<cudf::size_type>(i)),
                                            stream,
-                                           target->get_default_allocator()));
+                                           sirius::memory::resident_allocator(target)));
         }
       }
     }
@@ -367,7 +368,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     }
     if (options.enable_compressed_materialization) {
       auto narrowed = narrow_pin_chunk(
-        std::move(tbl), pinned_column_types, stream, target->get_default_allocator());
+        std::move(tbl), pinned_column_types, stream, sirius::memory::resident_allocator(target));
       tbl              = std::move(narrowed.table);
       narrowed_columns = std::move(narrowed.columns);
     }
@@ -837,7 +838,7 @@ device_pin_result materialize_all_batches_compressed(
               std::size_t const payload_capacity =
                 align_up(cur, kLeafAlign) + kLeafAlign;  // tail slop for the last buffer
               blob->payload =
-                rmm::device_buffer(payload_capacity, stream, src_space->get_default_allocator());
+                rmm::device_buffer(payload_capacity, stream, sirius::memory::resident_allocator(src_space));
               // Zero first: inter-leaf alignment padding and the tail slop are never
               // written by the copies below, and a bitpacked decode reads a few bytes
               // past a leaf's logical end — zeros keep those reads benign.

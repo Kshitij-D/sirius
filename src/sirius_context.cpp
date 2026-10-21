@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
 #include "pipeline/sched_policy.hpp"
+#include "memory/resident_ledger.hpp"
 #include "cuda/device_health.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "duckdb/common/helper.hpp"
@@ -1234,6 +1235,9 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   if (auto gpus = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
       !gpus.empty()) {
     sirius::sched::bind_gpu_space(gpus.front());
+    for (auto const* sp : gpus) {
+      if (auto const* c = sirius::memory::resident_counter(sp)) { sp->set_resident_counter(c); }
+    }
   }
   if (auto hosts = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
       !hosts.empty()) {

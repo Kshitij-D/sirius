@@ -1,5 +1,7 @@
 #include "pipeline/sched_policy.hpp"
 
+#include "memory/resident_ledger.hpp"
+
 #include "parallel/task.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -255,6 +257,8 @@ std::size_t sauron_predict(state& s, task_ids const& id)
   return static_cast<std::size_t>(r * static_cast<double>(std::max<std::size_t>(id.basis, 1)));
 }
 
+bool drain_holds(parallel::itask const& task) noexcept;  // ledger drain, defined below
+
 void announce(state& s)
 {
   if (s.announced) { return; }
@@ -344,6 +348,7 @@ void scan_begin() noexcept
 
 void scan_consider(parallel::itask const& task) noexcept
 {
+  if (drain_holds(task)) { return; }
   auto& s = S();
   task_ids id;
   if (!ids_of(task, id)) { return; }
@@ -410,8 +415,75 @@ parallel::itask const* scan_best() noexcept
   return s.best;
 }
 
+namespace {
+
+struct drain_state {
+  std::mutex mu;
+  parallel::itask const* owner = nullptr;
+  clock::time_point since{};
+  std::uint64_t drains = 0, abandoned = 0;
+};
+
+drain_state& D()
+{
+  static drain_state d;
+  return d;
+}
+
+// True when a drain is active and `task` is not its owner. Abandons a drain past its maximum.
+bool drain_holds(parallel::itask const& task) noexcept
+{
+  if (!memory::ledger_enabled()) { return false; }
+  auto& d = D();
+  std::lock_guard lk(d.mu);
+  if (d.owner == nullptr || d.owner == &task) { return false; }
+  if (clock::now() - d.since > std::chrono::milliseconds(env_size("SIRIUS_LEDGER_DRAIN_MAX_MS", 10000))) {
+    d.owner = nullptr;
+    ++d.abandoned;
+    std::fprintf(stderr, "[ledger] drain abandoned (drains=%llu abandoned=%llu)\n",
+                 static_cast<unsigned long long>(d.drains), static_cast<unsigned long long>(d.abandoned));
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+void ledger_note_refusal(parallel::itask& task) noexcept
+{
+  if (!memory::ledger_enabled()) { return; }
+  auto const now = clock::now();
+  if (task.sched_wait_since == clock::time_point{}) { task.sched_wait_since = now; }
+  auto& d = D();
+  std::lock_guard lk(d.mu);
+  if (d.owner == nullptr &&
+      now - task.sched_wait_since > std::chrono::milliseconds(env_size("SIRIUS_LEDGER_DRAIN_MS", 1000))) {
+    d.owner = &task;
+    d.since = now;
+    ++d.drains;
+  }
+}
+
+void ledger_note_granted(parallel::itask& task) noexcept
+{
+  task.sched_wait_since = clock::time_point{};
+  if (!memory::ledger_enabled()) { return; }
+  auto& d = D();
+  std::lock_guard lk(d.mu);
+  if (d.owner == &task) { d.owner = nullptr; }
+}
+
+void ledger_task_destroyed(parallel::itask const& task) noexcept
+{
+  if (!memory::ledger_enabled()) { return; }
+  auto& d = D();
+  std::lock_guard lk(d.mu);
+  if (d.owner == &task) { d.owner = nullptr; }
+}
+
 bool task_may_dispatch(parallel::itask const& task, bool& scan_blocked) noexcept
 {
+  if (drain_holds(task)) { return false; }
   auto& s = S();
   if (s.kind == policy_kind::upstream || s.kind == policy_kind::multiqx) { return true; }
   if (scan_blocked) { return false; }

@@ -16,6 +16,7 @@
 
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/sched_policy.hpp"
+#include "memory/resident_ledger.hpp"
 
 #include "creator/task_creator.hpp"
 #include "cucascade/memory/stream_pool.hpp"
@@ -246,8 +247,15 @@ void gpu_pipeline_executor::process_task(
     // achievable; any per-batch overflow during execution is still handled by
     // the OOM-reschedule + tiering path. (Telemetry above intentionally reports
     // the pre-clamp estimate so the estimator can still be analyzed.)
-    if (auto const space_max = _memory_space->get_max_memory();
-        space_max > 0 && bytes_needs > space_max) {
+    // Ledger (SIRIUS_LEDGER): resident pinned bytes can never be reserved, so the most any
+    // request can be granted is the limit minus resident bytes. Capping there keeps every request
+    // satisfiable once other reservations drain.
+    auto const grantable =
+      memory::ledger_enabled()
+        ? _memory_space->get_max_memory() -
+            std::min(_memory_space->get_max_memory(), memory::resident_bytes(_memory_space))
+        : _memory_space->get_max_memory();
+    if (auto const space_max = grantable; space_max > 0 && bytes_needs > space_max) {
       SIRIUS_LOG_DEBUG(
         "GPU Pipeline Executor: clamping reservation request {} -> {} bytes (space max) for "
         "pipeline {} task {}",
@@ -317,12 +325,14 @@ void gpu_pipeline_executor::process_task(
       }
       pipeline_task->retry_not_before = pipeline_task->memory_wait.retry_at();
       sched::on_task_released(*pipeline_task);
+      sched::ledger_note_refusal(*pipeline_task);
       if (!_task_creator) { throw std::logic_error("GPU retry requires a task creator"); }
       _task_creator->reschedule(std::move(pipeline_task));
       return;  // releases the reserved worker slot
     }
     pipeline_task->memory_wait.reset();
     pipeline_task->memory_wait_activity.reset();
+    sched::ledger_note_granted(*pipeline_task);
     if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
           gpu_task->local_state())) {
       local_state->set_reservation(std::move(reservation), reservation_info);

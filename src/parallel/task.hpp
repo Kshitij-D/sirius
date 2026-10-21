@@ -120,6 +120,7 @@ class itask {
   std::size_t sched_grant = 0;
   mutable std::size_t sched_pred = 0;
   std::chrono::steady_clock::time_point sched_start{};
+  std::chrono::steady_clock::time_point sched_wait_since{};  // first refused reservation
   exec::query_lifecycle_registry::memory_wait_guard memory_wait_activity;
 
   // Execution function.

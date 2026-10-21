@@ -79,6 +79,15 @@ void on_task_completed(const parallel::itask& task,
                        std::size_t output_bytes,
                        bool ratio_eligible) noexcept;
 
+/// Ledger drain (SIRIUS_LEDGER=1, any policy): a task whose reservation has been refused for
+/// longer than SIRIUS_LEDGER_DRAIN_MS (default 1000) becomes the drain owner; no other task is
+/// dispatched until the owner's reservation is granted, so a large request is served as soon as
+/// running work finishes instead of starving behind it. A drain that has not been granted after
+/// SIRIUS_LEDGER_DRAIN_MAX_MS (default 10000) is abandoned so it can never become a livelock.
+void ledger_note_refusal(parallel::itask& task) noexcept;
+void ledger_note_granted(parallel::itask& task) noexcept;
+void ledger_task_destroyed(const parallel::itask& task) noexcept;
+
 /// Query lifecycle (all policies record; only multiqx blocks in query_admit_wait).
 void query_begin(std::size_t query_id, const std::string& sql) noexcept;
 void query_admit_wait(std::size_t query_id, const std::function<bool()>& interrupted);

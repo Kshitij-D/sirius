@@ -1,0 +1,125 @@
+#include "memory/resident_ledger.hpp"
+
+#include <cucascade/memory/memory_space.hpp>
+
+#include <cuda/memory_resource>
+
+#include <cstdlib>
+#include <map>
+#include <memory>
+#include <mutex>
+
+namespace sirius::memory {
+namespace {
+
+// Pass-through resource that adds live bytes to a counter. Columns keep a reference to it, so it
+// is never destroyed (one per memory space, process lifetime).
+class counting_resource {
+ public:
+  counting_resource(rmm::device_async_resource_ref upstream, std::atomic<std::size_t>* counter)
+    : _upstream(upstream), _counter(counter)
+  {
+  }
+
+  void* allocate(::cuda::stream_ref stream,
+                 std::size_t bytes,
+                 std::size_t alignment = alignof(std::max_align_t))
+  {
+    void* p = _upstream.allocate(stream, bytes, alignment);
+    _counter->fetch_add(bytes, std::memory_order_relaxed);
+    return p;
+  }
+
+  void deallocate(::cuda::stream_ref stream,
+                  void* p,
+                  std::size_t bytes,
+                  std::size_t alignment = alignof(std::max_align_t)) noexcept
+  {
+    _upstream.deallocate(stream, p, bytes, alignment);
+    _counter->fetch_sub(bytes, std::memory_order_relaxed);
+  }
+
+  void* allocate_sync(std::size_t bytes, std::size_t alignment = alignof(std::max_align_t))
+  {
+    void* p = _upstream.allocate_sync(bytes, alignment);
+    _counter->fetch_add(bytes, std::memory_order_relaxed);
+    return p;
+  }
+
+  void deallocate_sync(void* p,
+                       std::size_t bytes,
+                       std::size_t alignment = alignof(std::max_align_t)) noexcept
+  {
+    _upstream.deallocate_sync(p, bytes, alignment);
+    _counter->fetch_sub(bytes, std::memory_order_relaxed);
+  }
+
+  bool operator==(counting_resource const& other) const noexcept { return this == &other; }
+
+  friend void get_property(counting_resource const&, ::cuda::mr::device_accessible) noexcept {}
+
+ private:
+  rmm::device_async_resource_ref _upstream;
+  std::atomic<std::size_t>* _counter;
+};
+
+struct entry {
+  std::atomic<std::size_t> bytes{0};
+  std::unique_ptr<counting_resource> mr;
+};
+
+std::mutex& mu()
+{
+  static std::mutex m;
+  return m;
+}
+
+std::map<const cucascade::memory::memory_space*, std::unique_ptr<entry>>& entries()
+{
+  static auto* e = new std::map<const cucascade::memory::memory_space*, std::unique_ptr<entry>>();
+  return *e;
+}
+
+entry& entry_for(const cucascade::memory::memory_space* space)
+{
+  std::lock_guard lk(mu());
+  auto& e = entries()[space];
+  if (!e) {
+    e     = std::make_unique<entry>();
+    e->mr = std::make_unique<counting_resource>(space->get_default_allocator(), &e->bytes);
+  }
+  return *e;
+}
+
+}  // namespace
+
+bool ledger_enabled() noexcept
+{
+  static bool const on = [] {
+    auto const* v = std::getenv("SIRIUS_LEDGER");
+    return v != nullptr && *v == '1';
+  }();
+  return on;
+}
+
+rmm::device_async_resource_ref resident_allocator(const cucascade::memory::memory_space* space)
+{
+  if (!ledger_enabled()) { return space->get_default_allocator(); }
+  return rmm::device_async_resource_ref{*entry_for(space).mr};
+}
+
+std::size_t resident_bytes(const cucascade::memory::memory_space* space) noexcept
+{
+  if (!ledger_enabled() || space == nullptr) { return 0; }
+  std::lock_guard lk(mu());
+  auto const it = entries().find(space);
+  return it == entries().end() ? 0 : it->second->bytes.load(std::memory_order_relaxed);
+}
+
+const std::atomic<std::size_t>* resident_counter(const cucascade::memory::memory_space* space)
+{
+  if (!ledger_enabled() || space == nullptr) { return nullptr; }
+  return &entry_for(space).bytes;
+}
+
+}  // namespace sirius::memory

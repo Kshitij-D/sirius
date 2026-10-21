@@ -633,6 +633,7 @@ gpu_pipeline_task::gpu_pipeline_task(
 gpu_pipeline_task::~gpu_pipeline_task()
 {
   sched::on_task_released(*this);
+  sched::ledger_task_destroyed(*this);
   for (const auto& weak_batch : _subscribed_batches) {
     auto batch = weak_batch.lock();
     if (!batch) { continue; }
