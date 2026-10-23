@@ -234,6 +234,38 @@ void tasklog_write(PipelinePtr const& pipeline, std::uint64_t task_id, Info cons
     if (!ops.empty()) { ops += '>'; }
     ops += op_ref.get().get_name();
   }
+  // Scan identity for the sharing study: table (file basename from the read's stable fingerprint,
+  // or its hash), scanned columns, and a hash of the static filter ("-" when none).
+  std::string scan = "-";
+  if (auto const& oprs = pipeline->get_operators(); !oprs.empty()) {
+    if (auto const* sc =
+          dynamic_cast<op::scan::sirius_gpu_scan_operator const*>(&oprs.front().get())) {
+      try {
+        auto const& c = sc->scan_contract();
+        std::string table = "?", cols;
+        if (c.view && c.view->identity) {
+          auto const& canon = c.view->identity->fingerprint.canonical;
+          auto const pq     = canon.find(".parquet");
+          if (pq != std::string::npos) {
+            auto const slash = canon.rfind('/', pq);
+            table = canon.substr(slash == std::string::npos ? 0 : slash + 1,
+                                 pq - (slash == std::string::npos ? 0 : slash + 1));
+          } else {
+            table = std::format("{:x}", std::hash<std::string>{}(canon));
+          }
+          auto const& names = c.view->identity->bound_names;
+          for (auto const& ci : c.columns.column_ids) {
+            auto const i = ci.GetPrimaryIndex();
+            if (i < names.size()) { cols += (cols.empty() ? "" : "|") + names[i]; }
+          }
+        }
+        auto const& ff = c.predicates.static_filter_fingerprint;
+        scan = table + ";" + cols + ";" +
+               (ff.empty() ? std::string("-") : std::format("{:x}", std::hash<std::string>{}(ff)));
+      } catch (...) {
+      }
+    }
+  }
   // One buffered handle per process (an open/close per row on a network file system serializes
   // tasks on the mutex); flushed every 256 rows, on OOM rows and at exit.
   static std::mutex tasklog_mutex;
@@ -255,12 +287,12 @@ void tasklog_write(PipelinePtr const& pipeline, std::uint64_t task_id, Info cons
     std::fprintf(f,
                  "t\tdur_ms\toutcome\tquery_id\tpipeline_id\ttask_id\tinput_basis\test_peak\t"
                  "had_history\tmat_bytes\treservation\tpeak\toutput_bytes\ttask_alloc\trequested\t"
-                 "global_usage\tpool_reserved\tpool_used\tdrv_free\top_index\terr_kind\tops\n");
+                 "global_usage\tpool_reserved\tpool_used\tdrv_free\top_index\terr_kind\tops\tscan\n");
     header_written = true;
   }
   std::fprintf(f,
                "%.4f\t%.3f\t%s\t%llu\t%zu\t%llu\t%zu\t%zu\t%d\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t"
-               "%llu\t%llu\t%zu\t%zu\t%d\t%s\n",
+               "%llu\t%llu\t%zu\t%zu\t%d\t%s\t%s\n",
                t,
                dur,
                e.outcome,
@@ -282,7 +314,8 @@ void tasklog_write(PipelinePtr const& pipeline, std::uint64_t task_id, Info cons
                drv_free,
                e.op_index,
                e.err_kind,
-               ops.c_str());
+               ops.c_str(),
+               scan.c_str());
   if (++rows % 256 == 0 || std::string_view(e.outcome) != "ok") { std::fflush(f); }
 }
 
