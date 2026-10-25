@@ -631,6 +631,9 @@ class sirius_physical_operator {
  public:
   // Source interface
   virtual bool is_source() const { return false; }
+  /// True when execute() returns its input batches unchanged (no data access), so a task whose
+  /// pipeline is only this operator need not materialize its inputs on the GPU.
+  [[nodiscard]] virtual bool forwards_input_unchanged() const noexcept { return false; }
 
   //! The type of order emitted by the operator (as a source)
   virtual sirius::OrderPreservationType source_order() const

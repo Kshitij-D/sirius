@@ -179,6 +179,26 @@ std::optional<std::size_t> resv_p80_estimate(std::string const& key)
   return static_cast<std::size_t>(v[k]);
 }
 
+// Experimental (env-gated, SIRIUS_TIER_FORWARD=1): a pipeline that is a single forwarding operator
+// (pass-through PARTITION) hands its input batches on at their current tier instead of reloading
+// spilled batches onto the GPU only to forward them (exp40: 48-62% of reloaded bytes).
+bool tier_forward_enabled()
+{
+  static bool const on = [] {
+    auto const* v = std::getenv("SIRIUS_TIER_FORWARD");
+    return v != nullptr && *v == '1';
+  }();
+  return on;
+}
+
+template <typename PipelinePtr>
+bool forward_only_pipeline(PipelinePtr const& pipeline)
+{
+  if (!tier_forward_enabled() || !pipeline) { return false; }
+  auto const& ops = pipeline->get_operators();
+  return ops.size() == 1 && ops.front().get().forwards_input_unchanged();
+}
+
 std::string const& tasklog_path()
 {
   static std::string const path = [] {
@@ -974,10 +994,12 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
            .data   = {.bytes = _reservation_bytes},
      }});
   try {
-    local_state._input_data->prepare_for_processing(requested_memory_space, stream);
-    // synchronizing here to ensure the timing collected by Quent and logging for preparing the task
-    // is accurate.
-    stream.sync();
+    if (!forward_only_pipeline(pipeline)) {
+      local_state._input_data->prepare_for_processing(requested_memory_space, stream);
+      // synchronizing here to ensure the timing collected by Quent and logging for preparing the
+      // task is accurate.
+      stream.sync();
+    }
   } catch (const rmm::out_of_memory& oom) {
     auto peak_bytes = allocator->get_peak_allocated_bytes(stream);
     std::optional<std::size_t> retry_requested_bytes;
@@ -1186,8 +1208,10 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
   auto& ls                         = _local_state->cast<gpu_pipeline_task_local_state>();
   auto& gs                         = _global_state->cast<gpu_pipeline_task_global_state>();
   std::size_t input_basis          = ls.get_task_consumption_basis();
-  std::size_t bytes_to_materialize = ls.get_estimated_bytes_to_materialize_input(target_space);
-  auto peak_opt                    = gs.get_memory_history().estimate_peak_memory(input_basis);
+  std::size_t bytes_to_materialize =
+    forward_only_pipeline(gs.get_pipeline()) ? 0
+                                             : ls.get_estimated_bytes_to_materialize_input(target_space);
+  auto peak_opt = gs.get_memory_history().estimate_peak_memory(input_basis);
   const auto input_type =
     ls._input_data ? ls._input_data->get_type() : op::operator_data_type::BASE;
   const bool input_resident = ls._input_data && ls._input_data->is_resident();

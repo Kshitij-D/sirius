@@ -143,6 +143,11 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// equal keys would land in different partitions and the consuming join would miss matches.
   [[nodiscard]] std::vector<int> const& partition_keys() const noexcept { return _partition_keys; }
 
+  [[nodiscard]] bool forwards_input_unchanged() const noexcept override
+  {
+    return _broadcast || (_num_partitions.has_value() && *_num_partitions < 2) ||
+           _partition_keys.empty();
+  }
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
 
