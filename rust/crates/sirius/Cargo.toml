@@ -25,5 +25,5 @@ arrow-schema = "59"
 # Building a `local_files` Substrait plan + a parquet fixture for the execute test.
 substrait = "0.64"
 prost = "0.14"
-parquet = "59"
+parquet = "60"
 tempfile = "3"
