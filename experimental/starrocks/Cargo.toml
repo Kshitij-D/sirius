@@ -24,7 +24,7 @@ mysql_async = { version = "0.37", default-features = false, features = ["minimal
 # runtime across the translator crate.
 prost = "0.14"
 prost-build = "0.14"
-parquet = { version = "59", default-features = false, features = ["arrow", "async"] }
+parquet = { version = "60", default-features = false, features = ["arrow", "async"] }
 heck = "0.5"
 prettyplease = "0.3.0"
 proc-macro2 = "1"
