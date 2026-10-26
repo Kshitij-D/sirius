@@ -631,7 +631,7 @@ void query_admit_wait(std::size_t query_id, std::function<bool()> const& interru
 void query_end(std::size_t query_id) noexcept
 {
   auto& s = S();
-  if (memory::ledger_enabled()) {
+  if (memory::resident_tracking_enabled()) {
     static std::atomic<std::uint64_t> n{0};
     if (n.fetch_add(1) % 50 == 0) {
       auto& d = D();

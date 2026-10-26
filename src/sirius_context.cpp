@@ -1236,6 +1236,7 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
       !gpus.empty()) {
     sirius::sched::bind_gpu_space(gpus.front());
     for (auto const* sp : gpus) {
+      if (!sirius::memory::evictable_trigger_enabled()) { continue; }
       if (auto const* c = sirius::memory::resident_counter(sp)) { sp->set_resident_counter(c); }
     }
   }

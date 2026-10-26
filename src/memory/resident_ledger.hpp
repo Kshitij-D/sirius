@@ -34,6 +34,14 @@ namespace sirius::memory {
 
 bool ledger_enabled() noexcept;
 
+/// Ablation switches (each defaults to SIRIUS_LEDGER; "0"/"1" forces it):
+///   SIRIUS_CAP_RESIDENT       request cap = limit - resident (the clamp fix)
+///   SIRIUS_EVICTABLE_TRIGGER  downgrade levels on evictable bytes
+/// Resident bytes are tracked whenever any of them (or the ledger) is on.
+bool cap_resident_enabled() noexcept;
+bool evictable_trigger_enabled() noexcept;
+bool resident_tracking_enabled() noexcept;
+
 /// Allocator for data that stays resident in `space` (pinned tables). With the ledger off this is
 /// the space's default allocator.
 rmm::device_async_resource_ref resident_allocator(const cucascade::memory::memory_space* space);

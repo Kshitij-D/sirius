@@ -251,7 +251,7 @@ void gpu_pipeline_executor::process_task(
     // request can be granted is the limit minus resident bytes. Capping there keeps every request
     // satisfiable once other reservations drain.
     auto const grantable =
-      memory::ledger_enabled()
+      memory::cap_resident_enabled()
         ? _memory_space->get_max_memory() -
             std::min(_memory_space->get_max_memory(), memory::resident_bytes(_memory_space))
         : _memory_space->get_max_memory();
