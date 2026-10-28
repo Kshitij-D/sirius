@@ -22,6 +22,18 @@
  *                       peak/input ratio x the task's real input size) fits the real free pool after the
  *                       outstanding predicted peaks of running tasks; first fit in priority order.
  *
+ * SIRIUS_BASELINE_V2=1 (E56) makes the baselines follow their sources more closely; default off keeps
+ * the earlier campaigns' behavior:
+ *   rapids   p80 by RAPIDS StatEstimator (interpolated at p(n+1), GpuSemaphore.scala); a retried task is
+ *            estimated at least at its OOM-derived floor (live + requested bytes at the OOM), as RAPIDS
+ *            keeps a retry's peak inside the same task.
+ *   multiqx  stock reservations (the engine's per-task memory wait = MultiQx "kernel waits for space");
+ *            demand = time-weighted average of the query's concurrent task footprints (sum of
+ *            duration x footprint over wall time), learned per query shape and updated while the query
+ *            runs (paper section 5: "dynamically updated as the query executes").
+ *   both     an OOM retry counts toward the retry limit only if no task completed since the task's
+ *            previous OOM (RAPIDS/MultiQx block until memory frees instead of failing on a count).
+ *
  * All non-upstream policies size the cuCascade reservation to the input materialization only, so the
  * policy, not the reservation ledger, gates memory. They must be run with SIRIUS_BORROW set so
  * allocations beyond a reservation are checked against the real pool.
@@ -31,6 +43,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <string>
 
@@ -50,6 +63,12 @@ policy_kind active_policy() noexcept;
 
 /// True when reservations should cover only input materialization (policy gates memory instead).
 bool minimal_reservations() noexcept;
+
+/// SIRIUS_BASELINE_V2=1: faithful baseline variants (see above).
+bool baseline_v2() noexcept;
+
+/// Successfully completed GPU pipeline tasks so far (any policy).
+std::uint64_t completed_tasks() noexcept;
 
 /// Called once by the runtime with the first GPU and first HOST memory spaces.
 void bind_gpu_space(const cucascade::memory::memory_space* space) noexcept;

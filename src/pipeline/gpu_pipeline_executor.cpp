@@ -449,6 +449,17 @@ void gpu_pipeline_executor::process_task(
             // too short. With 100 retries × 50 ms backoff (~5 s) the probe
             // tasks get enough patience to clear the contention window while
             // still bailing out on truly wedged queries.
+            // SIRIUS_BASELINE_V2: a retry after another task completed is a wait for freed memory,
+            // not a failed attempt (RAPIDS / MultiQx block until memory frees); a hard cap on all
+            // retries still ends a task that can never fit.
+            uint32_t const total_retries = (cur_local ? cur_local->retry_total : 0) + 1;
+            uint64_t const progress      = sched::completed_tasks();
+            if (sched::baseline_v2() && sched::active_policy() != sched::policy_kind::upstream &&
+                cur_local && cur_local->original_task_id.has_value() &&
+                progress != cur_local->retry_progress_mark) {
+              next_retry_count = cur_local->retry_count;
+            }
+            if (sched::baseline_v2() && total_retries > 10000) { next_retry_count = UINT32_MAX; }
             auto const MAX_RETRIES = completion && completion->injections
                                        ? completion->injections->gpu_task_retry_limit
                                        : 100;
@@ -494,7 +505,9 @@ void gpu_pipeline_executor::process_task(
             // Build the rescheduled task via virtual factory (preserves derived type).
             auto new_local_state = std::make_unique<gpu_pipeline_task_local_state>(
               std::move(intermediate_data), ex.get_resume_operator_index());
-            new_local_state->retry_count      = next_retry_count;
+            new_local_state->retry_count         = next_retry_count;
+            new_local_state->retry_total         = total_retries;
+            new_local_state->retry_progress_mark = progress;
             new_local_state->original_task_id = orig_task_id;
             if (cur_local) { new_local_state->inherit_retry_reservation_floor(*cur_local); }
 

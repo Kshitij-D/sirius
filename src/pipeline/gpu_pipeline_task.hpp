@@ -93,6 +93,9 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
   uint32_t retry_count = 0;
   /// Task ID of the original (non-retried) task; only meaningful when retry_count > 0.
   std::optional<uint64_t> original_task_id = std::nullopt;
+  /// SIRIUS_BASELINE_V2: completed-task count at the last reschedule, and all reschedules so far.
+  uint64_t retry_progress_mark = 0;
+  uint32_t retry_total         = 0;
 
   /// Request-size fallback used when an OOM does not expose the failed allocation size.
   static constexpr std::size_t kDefaultRetryRequestBytes = 1024 * 1024;

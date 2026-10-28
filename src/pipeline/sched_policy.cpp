@@ -144,6 +144,7 @@ struct class_stats {
 
 struct running_query {
   std::size_t fp       = 0;
+  clock::time_point admitted_at{};  // multiqx v2: start of the demand window
   double done_sec      = 0;  // sauron2: task seconds completed so far
   std::size_t demand   = 0;  // multiqx: admitted weighted demand
   double weighted_sum  = 0;  // sum(duration * footprint)
@@ -193,6 +194,33 @@ state& S()
   return s;
 }
 
+std::atomic<std::uint64_t> g_completed{0};
+
+// RAPIDS StatEstimator.percentile: values plus active estimates, padded with the default to at least
+// 4 entries, sorted, linear interpolation at position p * (n + 1) (1-based), clamped to the ends.
+std::size_t rapids_percentile(std::vector<std::size_t> v, std::size_t dflt, double p)
+{
+  while (v.size() < 4) { v.push_back(dflt); }
+  std::sort(v.begin(), v.end());
+  double const n   = static_cast<double>(v.size());
+  double const pos = p * (n + 1);
+  if (pos < 1) { return v.front(); }
+  if (pos >= n) { return v.back(); }
+  auto const k      = static_cast<std::size_t>(pos);
+  double const frac = pos - static_cast<double>(k);
+  return static_cast<std::size_t>(static_cast<double>(v[k - 1]) +
+                                  frac * (static_cast<double>(v[k]) - static_cast<double>(v[k - 1])));
+}
+
+std::size_t retry_floor_of(parallel::itask const& t) noexcept
+{
+  auto const* g = dynamic_cast<pipeline::gpu_pipeline_task const*>(&t);
+  if (g == nullptr) { return 0; }
+  auto const* ls = dynamic_cast<pipeline::gpu_pipeline_task_local_state const*>(
+    const_cast<pipeline::gpu_pipeline_task*>(g)->local_state());  // read-only; local_state() has no const overload
+  return ls ? ls->get_retry_reservation_floor() : 0;
+}
+
 std::size_t limit_bytes(state const& s) noexcept { return s.gpu ? s.gpu->get_max_memory() : 0; }
 
 std::size_t pool_used(state const& s) noexcept
@@ -240,6 +268,7 @@ std::size_t rapids_estimate(state& s, task_ids const& id)
   if (auto it = s.stage_active.find(key); it != s.stage_active.end()) {
     v.insert(v.end(), it->second.begin(), it->second.end());
   }
+  if (baseline_v2()) { return std::min(rapids_percentile(std::move(v), dflt, 0.8), cap); }
   while (v.size() < 4) { v.push_back(dflt); }
   auto const k = static_cast<std::size_t>(0.8 * static_cast<double>(v.size() - 1));
   std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(k), v.end());
@@ -271,7 +300,21 @@ void announce(state& s)
 
 policy_kind active_policy() noexcept { return S().kind; }
 
-bool minimal_reservations() noexcept { return S().kind != policy_kind::upstream; }
+bool minimal_reservations() noexcept
+{
+  return S().kind != policy_kind::upstream && !(S().kind == policy_kind::multiqx && baseline_v2());
+}
+
+bool baseline_v2() noexcept
+{
+  static bool const v = [] {
+    auto const* p = std::getenv("SIRIUS_BASELINE_V2");
+    return p != nullptr && *p == '1';
+  }();
+  return v;
+}
+
+std::uint64_t completed_tasks() noexcept { return g_completed.load(std::memory_order_relaxed); }
 
 void bind_gpu_space(cucascade::memory::memory_space const* space) noexcept
 {
@@ -502,7 +545,8 @@ bool task_may_dispatch(parallel::itask const& task, bool& scan_blocked) noexcept
   if (s.running == 0) { return true; }  // progress: something always runs
   bool fits = false;
   if (s.kind == policy_kind::rapids) {
-    auto const est = rapids_estimate(s, id);
+    auto est = rapids_estimate(s, id);
+    if (baseline_v2()) { est = std::min(std::max(est, retry_floor_of(task)), capacity(s)); }
     fits           = s.granted + est <= capacity(s);
     if (!fits) { scan_blocked = true; }  // head-of-line blocking, no backfill
     task.sched_pred = est;
@@ -555,6 +599,7 @@ void on_task_completed(parallel::itask const& task,
                        std::size_t output_bytes,
                        bool ratio_eligible) noexcept
 {
+  g_completed.fetch_add(1, std::memory_order_relaxed);
   auto& s = S();
   if (s.kind == policy_kind::upstream) { return; }
   task_ids id;
@@ -584,8 +629,17 @@ void on_task_completed(parallel::itask const& task,
         std::chrono::duration<double>(clock::now() - task.sched_start).count();
       it->second.weighted_sum += d * static_cast<double>(footprint);
       it->second.duration_sum += d;
+      if (baseline_v2() && it->second.admitted) {
+        // Demand so far = time average of the query's concurrent footprint; replaces the
+        // admission estimate once the window is long enough to mean something.
+        double const w = std::chrono::duration<double>(clock::now() - it->second.admitted_at).count();
+        if (w >= 1.0) {
+          it->second.demand = std::min(capacity(s), static_cast<std::size_t>(it->second.weighted_sum / w));
+        }
+      }
     }
   }
+  if (s.kind == policy_kind::multiqx && baseline_v2()) { s.cv.notify_all(); }
 }
 
 void query_begin(std::size_t query_id, std::string const& sql) noexcept
@@ -624,8 +678,9 @@ void query_admit_wait(std::size_t query_id, std::function<bool()> const& interru
     it = s.queries.find(query_id);
     if (it == s.queries.end()) { return; }
   }
-  it->second.admitted = true;
-  it->second.demand   = demand;
+  it->second.admitted    = true;
+  it->second.demand      = demand;
+  it->second.admitted_at = clock::now();
 }
 
 void query_end(std::size_t query_id) noexcept
@@ -653,8 +708,12 @@ void query_end(std::size_t query_id) noexcept
         w       = w <= 0 ? it->second.done_sec : 0.5 * w + 0.5 * it->second.done_sec;
       }
       if (s.kind == policy_kind::multiqx && it->second.duration_sum > 0) {
+        double const w =
+          std::chrono::duration<double>(clock::now() - it->second.admitted_at).count();
         s.qx_demand[it->second.fp] =
-          static_cast<std::size_t>(it->second.weighted_sum / it->second.duration_sum);
+          baseline_v2() && it->second.admitted && w > 0
+            ? static_cast<std::size_t>(it->second.weighted_sum / w)
+            : static_cast<std::size_t>(it->second.weighted_sum / it->second.duration_sum);
       }
       s.queries.erase(it);
     }
