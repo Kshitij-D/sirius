@@ -1,6 +1,8 @@
 #include "op/sirius_physical_shared_result_scan.hpp"
 
 #include "op/sirius_physical_gpu_values.hpp"
+#include "pipeline/sirius_meta_pipeline.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 #include "telemetry/nvtx.hpp"
 
 namespace sirius::op {
@@ -9,12 +11,29 @@ sirius_physical_shared_result_scan::sirius_physical_shared_result_scan(
   duckdb::vector<sirius::logical_type> types,
   std::size_t estimated_cardinality,
   std::shared_ptr<const memory::shared_result> result,
-  std::uint64_t key)
+  std::uint64_t key,
+  duckdb::unique_ptr<sirius_physical_operator> dormant_body)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::GPU_VALUES, std::move(types), estimated_cardinality),
     _result(std::move(result)),
     _key(key)
 {
+  if (dormant_body) { children.push_back(std::move(dormant_body)); }
+}
+
+void sirius_physical_shared_result_scan::build_pipelines(pipeline::sirius_pipeline& current,
+                                                         pipeline::sirius_meta_pipeline& meta_pipeline)
+{
+  // Source leaf: the dormant body gets no pipeline.
+  meta_pipeline.get_state().add_pipeline_operator(current, *this);
+}
+
+duckdb::vector<duckdb::const_reference<sirius_physical_operator>>
+sirius_physical_shared_result_scan::get_sources() const
+{
+  duckdb::vector<duckdb::const_reference<sirius_physical_operator>> result;
+  result.push_back(*this);
+  return result;
 }
 
 std::optional<task_creation_hint> sirius_physical_shared_result_scan::get_next_task_hint()

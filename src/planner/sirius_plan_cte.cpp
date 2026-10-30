@@ -17,6 +17,8 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/common/enums/logical_operator_type.hpp"
+#include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "helper/type_conversions.hpp"
 #include "memory/shared_results.hpp"
@@ -25,6 +27,29 @@
 #include "planner/sirius_physical_plan_generator.hpp"
 
 namespace sirius::planner {
+
+namespace {
+
+//! Full, untruncated text of an optimized logical subtree: operator types, every parameter string
+//! (filters, projections, aggregates, join conditions) and the output types, recursively.
+std::string optimized_plan_signature(duckdb::LogicalOperator const& op)
+{
+  std::string out = duckdb::LogicalOperatorToString(op.type) + "{";
+  for (auto const& kv : op.ParamsToString()) {
+    out += kv.first + "=" + kv.second + ";";
+  }
+  out += "types=";
+  for (auto const& t : op.types) {
+    out += t.ToString() + ",";
+  }
+  out += "}(";
+  for (auto const& child : op.children) {
+    out += optimized_plan_signature(*child) + ",";
+  }
+  return out + ")";
+}
+
+}  // namespace
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalMaterializedCTE& op)
@@ -53,22 +78,40 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalMaterializedCTE& op)
     }
     auto const key = sirius::memory::cte_share_key(sql, op.ctename.GetIdentifierName());
     if (key && sirius::memory::share_key_allowed(*key)) {
-      share_key = *key;
+      // The batch planner's text key is not enough: DuckDB pushes consumer filters into a
+      // materialized CTE and prunes its columns per query (E66 smoke: q31). The registry key also
+      // covers the optimized body.
+      share_key = sirius::memory::combine_share_key(*key, optimized_plan_signature(*op.children[0]));
       shared    = sirius::memory::find_shared_result(share_key);
       if (shared && shared->logical_types != op.children[0]->types) { shared = nullptr; }
     }
   }
 
   // Create the plan for the left side. This is the materialization.
-  duckdb::unique_ptr<sirius::op::sirius_physical_operator> left;
+  // The body is planned even when a shared result replaces it, and kept as the replay source's
+  // dormant child: plan post-passes (scan certification, the transparent-execution read-view check)
+  // still see its scans, but it gets no pipeline. Not shared if the body added CTE scans of an
+  // enclosing CTE (that CTE would wait on scans that never run).
+  std::size_t cte_scan_refs = 0;
+  for (auto const& [idx, scans] : materialized_ctes) {
+    cte_scan_refs += scans.size();
+  }
+  auto left = create_plan(*op.children[0]);
   if (shared) {
-    left = duckdb::make_uniq<sirius::op::sirius_physical_shared_result_scan>(
-      sirius::from_duckdb_vec(op.children[0]->types),
-      op.children[0]->estimated_cardinality,
-      shared,
-      share_key);
-  } else {
-    left = create_plan(*op.children[0]);
+    std::size_t after = 0;
+    for (auto const& [idx, scans] : materialized_ctes) {
+      after += scans.size();
+    }
+    if (after == cte_scan_refs) {
+      left = duckdb::make_uniq<sirius::op::sirius_physical_shared_result_scan>(
+        sirius::from_duckdb_vec(op.children[0]->types),
+        op.children[0]->estimated_cardinality,
+        shared,
+        share_key,
+        std::move(left));
+    } else {
+      shared = nullptr;
+    }
   }
   // Initialize an empty vector to collect the scan operators.
   auto right = create_plan(*op.children[1]);

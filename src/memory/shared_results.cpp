@@ -179,6 +179,28 @@ std::optional<std::uint64_t> cte_share_key(const std::string& sql, const std::st
   return std::nullopt;
 }
 
+std::uint64_t combine_share_key(std::uint64_t text_key, const std::string& plan_signature)
+{
+  char hex[17];
+  std::snprintf(hex, sizeof(hex), "%016llx", static_cast<unsigned long long>(text_key));
+  auto const key = fnv1a(std::string(hex) + "|" + plan_signature);
+  static bool const debug = [] {
+    auto const* v = std::getenv("SIRIUS_SHARE_DEBUG");
+    return v != nullptr && *v == '1';
+  }();
+  if (debug) {
+    auto& r = reg();
+    static std::unordered_set<std::uint64_t> seen;
+    std::lock_guard lk(r.mu);
+    if (seen.insert(key).second) {
+      std::fprintf(stderr, "[share] signature key=%016llx text=%s len=%zu sig=%s\n",
+                   static_cast<unsigned long long>(key), hex, plan_signature.size(),
+                   plan_signature.c_str());
+    }
+  }
+  return key;
+}
+
 bool share_key_allowed(std::uint64_t key) noexcept
 {
   auto& r = reg();
