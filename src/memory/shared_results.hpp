@@ -11,7 +11,9 @@
  * The first query that finishes such a CTE publishes its GPU batches here (if the total stays within
  * SIRIUS_SHARE_BUDGET_BYTES, default 4 GiB); their bytes are charged to the resident ledger so the
  * reservation cap sees them. Later queries that plan the same CTE replay the published batches through
- * a single-shot source instead of recomputing the body. Entries live until the process ends (one batch).
+ * a single-shot source instead of recomputing the body. With a prepare pass (sirius_share_prepare) a
+ * result is published only if a later consumer exists and released after its last consumer finishes;
+ * without one, entries live until the process ends.
  */
 #pragma once
 
@@ -26,6 +28,13 @@
 
 namespace cucascade {
 class data_batch;
+namespace memory {
+class memory_space;
+}
+}  // namespace cucascade
+
+namespace duckdb {
+class LogicalOperator;
 }
 
 namespace sirius::memory {
@@ -34,6 +43,7 @@ struct shared_result {
   std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
   duckdb::vector<duckdb::LogicalType> logical_types;
   std::size_t bytes = 0;
+  const ::cucascade::memory::memory_space* space = nullptr;
 };
 
 /// True when SIRIUS_SHARE_KEYS names a readable key file.
@@ -57,6 +67,24 @@ std::shared_ptr<const shared_result> find_shared_result(std::uint64_t key);
 void publish_shared_result(std::uint64_t key,
                            std::vector<std::shared_ptr<::cucascade::data_batch>> batches,
                            duckdb::vector<duckdb::LogicalType> logical_types);
+
+/// Full, untruncated text of an optimized logical subtree: operator types, every parameter string
+/// (filters, projections, aggregates, join conditions) and the output types, recursively.
+std::string optimized_plan_signature(duckdb::LogicalOperator const& op);
+
+/// Batch prepare pass: count, for the optimized plan of statement `sql`, one planned consumer per
+/// allowed materialized CTE key. Once any count exists, a result is published only if a consumer that
+/// has not finished will plan it, and released when its last counted consumer finishes.
+std::size_t count_expected_shares(const std::string& sql, duckdb::LogicalOperator const& plan);
+
+/// Counting mode for the prepare pass (this thread only): while set, the post-optimizer hook counts
+/// the captured plan of `sql` (the same plan create_plan receives) into the batch counts.
+void set_counting_sql(const std::string* sql) noexcept;
+const std::string* counting_sql() noexcept;
+std::size_t& counted_in_thread() noexcept;
+
+/// A query's CTE with this key finished (computed or replayed): count it, release when done.
+void note_shared_cte_finished(std::uint64_t key);
 
 /// Count a consumer that replayed `key` (log only).
 void note_shared_hit(std::uint64_t key, std::size_t bytes);

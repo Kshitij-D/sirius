@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "memory/shared_results.hpp"
 #include "config.hpp"
 #include "cuda/device_health.hpp"
 #include "data/data_batch_utils.hpp"
@@ -1598,6 +1599,56 @@ static void SiriusSetQueryLabelFunction(ClientContext& context,
   data.finished = true;
 }
 
+// E66b batch prepare pass (memory/shared_results.hpp): plan one statement of the batch (parse, bind,
+// optimize; nothing runs) on a fresh connection with the batch connections' settings, and count one
+// planned consumer per allowed materialized-CTE key. Returns the number counted, -1 on failure.
+struct SiriusSharePrepareData : public TableFunctionData {
+  std::string sql;
+  bool finished = false;
+};
+
+static unique_ptr<FunctionData> SiriusSharePrepareBind(ClientContext& context,
+                                                       TableFunctionBindInput& input,
+                                                       vector<LogicalType>& return_types,
+                                                       vector<Identifier>& names)
+{
+  if (input.inputs.empty() || input.inputs[0].IsNull()) {
+    throw BinderException("sirius_share_prepare requires a non-NULL VARCHAR argument");
+  }
+  auto result = make_uniq<SiriusSharePrepareData>();
+  result->sql = input.inputs[0].ToString();
+  return_types.push_back(LogicalType::BIGINT);
+  names.push_back("counted");
+  return std::move(result);
+}
+
+static void SiriusSharePrepareFunction(ClientContext& context,
+                                       TableFunctionInput& data_p,
+                                       DataChunk& output)
+{
+  auto& data = data_p.bind_data->CastNoConst<SiriusSharePrepareData>();
+  if (data.finished) { return; }
+  // Counting happens in the post-optimizer hook on the captured plan (the plan create_plan gets).
+  // ExtractPlan may fail afterwards in DuckDB's binding check on Sirius-hooked plans; the count
+  // is taken before that, so the failure is expected and ignored.
+  int64_t counted = -1;
+  {
+    Connection con(DatabaseInstance::GetDatabase(context));
+    con.Query("SET gpu_execution = true");
+    con.Query("SET enable_duckdb_fallback = false");
+    sirius::memory::set_counting_sql(&data.sql);
+    try {
+      con.ExtractPlan(data.sql);
+    } catch (std::exception&) {
+    }
+    counted = static_cast<int64_t>(sirius::memory::counted_in_thread());
+    sirius::memory::set_counting_sql(nullptr);
+  }
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value::BIGINT(counted));
+  data.finished = true;
+}
+
 struct CreateAnnIndexData : public TableFunctionData {
   std::string table_name;
   std::string column_name;
@@ -2364,6 +2415,13 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
                                   SiriusSetSessionLabelBind);
   CreateTableFunctionInfo set_session_label_info(set_session_label);
   catalog.CreateTableFunction(transaction, set_session_label_info);
+
+  TableFunction share_prepare("sirius_share_prepare",
+                              {LogicalType::VARCHAR},
+                              SiriusSharePrepareFunction,
+                              SiriusSharePrepareBind);
+  CreateTableFunctionInfo share_prepare_info(share_prepare);
+  catalog.CreateTableFunction(transaction, share_prepare_info);
 
   // Profiler control functions for nsys --capture-range=cudaProfilerApi
   TableFunction profiler_start(

@@ -28,29 +28,6 @@
 
 namespace sirius::planner {
 
-namespace {
-
-//! Full, untruncated text of an optimized logical subtree: operator types, every parameter string
-//! (filters, projections, aggregates, join conditions) and the output types, recursively.
-std::string optimized_plan_signature(duckdb::LogicalOperator const& op)
-{
-  std::string out = duckdb::LogicalOperatorToString(op.type) + "{";
-  for (auto const& kv : op.ParamsToString()) {
-    out += kv.first + "=" + kv.second + ";";
-  }
-  out += "types=";
-  for (auto const& t : op.types) {
-    out += t.ToString() + ",";
-  }
-  out += "}(";
-  for (auto const& child : op.children) {
-    out += optimized_plan_signature(*child) + ",";
-  }
-  return out + ")";
-}
-
-}  // namespace
-
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalMaterializedCTE& op)
 {
@@ -81,7 +58,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalMaterializedCTE& op)
       // The batch planner's text key is not enough: DuckDB pushes consumer filters into a
       // materialized CTE and prunes its columns per query (E66 smoke: q31). The registry key also
       // covers the optimized body.
-      share_key = sirius::memory::combine_share_key(*key, optimized_plan_signature(*op.children[0]));
+      share_key = sirius::memory::combine_share_key(
+        *key, sirius::memory::optimized_plan_signature(*op.children[0]));
       shared    = sirius::memory::find_shared_result(share_key);
       if (shared && shared->logical_types != op.children[0]->types) { shared = nullptr; }
     }
@@ -129,8 +107,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalMaterializedCTE& op)
   cte->working_table = working_table;
   // cte->working_table_gpu = working_table_gpu;
   cte->cte_scans = materialized_ctes[op.table_index];
-  if (share_key != 0 && !shared) {
+  if (share_key != 0) {
     cte->share_key           = share_key;
+    cte->share_consumer      = shared != nullptr;
     cte->share_logical_types = op.children[0]->types;
   }
 

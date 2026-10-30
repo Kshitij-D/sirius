@@ -60,6 +60,8 @@ class sirius_physical_cte : public sirius_physical_operator {
   //! Cross-query sharing (memory/shared_results.hpp): nonzero = publish this CTE's result under
   //! the key when its producing pipeline finishes.
   std::uint64_t share_key = 0;
+  //! True when the body was replaced by a replay of a published result (nothing to publish).
+  bool share_consumer = false;
   duckdb::vector<duckdb::LogicalType> share_logical_types;
 
   void sink(const operator_data& input_data, ::cuda::stream_ref stream) override;

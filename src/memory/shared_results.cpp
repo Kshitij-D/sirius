@@ -2,6 +2,10 @@
 
 #include "memory/resident_ledger.hpp"
 
+#include "duckdb/common/enums/logical_operator_type.hpp"
+#include "duckdb/planner/logical_operator.hpp"
+#include "duckdb/planner/operator/logical_materialized_cte.hpp"
+
 #include <cucascade/data/data_batch.hpp>
 
 #include <cctype>
@@ -21,6 +25,11 @@ struct registry {
   std::unordered_set<std::uint64_t> allowed;
   std::unordered_map<std::uint64_t, std::shared_ptr<const shared_result>> published;
   std::unordered_set<std::uint64_t> refused;  // over budget: logged once
+  // Batch counts (sirius_share_prepare): planned consumers per key, and consumers whose CTE
+  // finished. Without a prepare pass (counted == false) results are held to the process end.
+  std::unordered_map<std::uint64_t, std::size_t> expected;
+  std::unordered_map<std::uint64_t, std::size_t> served;
+  bool counted = false;
   std::size_t used = 0;
   std::size_t budget = std::size_t{4} << 30;
   bool on = false;
@@ -191,11 +200,12 @@ std::uint64_t combine_share_key(std::uint64_t text_key, const std::string& plan_
   if (debug) {
     auto& r = reg();
     static std::unordered_set<std::uint64_t> seen;
+    bool const prepare = counting_sql() != nullptr;
     std::lock_guard lk(r.mu);
-    if (seen.insert(key).second) {
-      std::fprintf(stderr, "[share] signature key=%016llx text=%s len=%zu sig=%s\n",
-                   static_cast<unsigned long long>(key), hex, plan_signature.size(),
-                   plan_signature.c_str());
+    if (seen.insert(key ^ (prepare ? 1ULL : 0ULL)).second) {
+      std::fprintf(stderr, "[share] signature phase=%s key=%016llx text=%s len=%zu sig=%s\n",
+                   prepare ? "prepare" : "exec", static_cast<unsigned long long>(key), hex,
+                   plan_signature.size(), plan_signature.c_str());
     }
   }
   return key;
@@ -229,6 +239,17 @@ void publish_shared_result(std::uint64_t key,
   }
   std::lock_guard lk(r.mu);
   if (r.published.count(key) != 0) { return; }
+  if (r.counted) {
+    // Publish only if a consumer that has not finished yet will plan this key (this producer's own
+    // finish is counted after publishing).
+    auto const exp  = r.expected.count(key) != 0 ? r.expected[key] : 0;
+    auto const done = r.served.count(key) != 0 ? r.served[key] : 0;
+    if (done + 1 >= exp) {
+      std::fprintf(stderr, "[share] no later consumer key=%016llx expected=%zu served=%zu\n",
+                   static_cast<unsigned long long>(key), exp, done);
+      return;
+    }
+  }
   if (r.used + bytes > r.budget) {
     if (r.refused.insert(key).second) {
       std::fprintf(stderr, "[share] over budget key=%016llx bytes=%zu used=%zu\n",
@@ -240,11 +261,80 @@ void publish_shared_result(std::uint64_t key,
   e->batches       = std::move(batches);
   e->logical_types = std::move(logical_types);
   e->bytes         = bytes;
+  e->space         = space;
   r.used += bytes;
-  add_resident(space, bytes);  // held until the process ends: the reservation cap must see it
+  add_resident(space, bytes);  // held until the last expected consumer finishes
   std::fprintf(stderr, "[share] publish key=%016llx batches=%zu bytes=%zu used=%zu\n",
                static_cast<unsigned long long>(key), e->batches.size(), bytes, r.used);
   r.published.emplace(key, std::move(e));
+}
+
+void note_shared_cte_finished(std::uint64_t key)
+{
+  auto& r = reg();
+  std::lock_guard lk(r.mu);
+  auto const done = ++r.served[key];
+  if (!r.counted) { return; }
+  auto const it = r.published.find(key);
+  if (it == r.published.end() || done < r.expected[key]) { return; }
+  // Last expected consumer finished: drop the registry's reference (consumers still reading keep
+  // the batches alive through their own shared_ptrs) and release the resident charge.
+  sub_resident(it->second->space, it->second->bytes);
+  r.used -= it->second->bytes;
+  std::fprintf(stderr, "[share] release key=%016llx bytes=%zu served=%zu used=%zu\n",
+               static_cast<unsigned long long>(key), it->second->bytes, done, r.used);
+  r.published.erase(it);
+}
+
+namespace {
+thread_local const std::string* t_counting_sql = nullptr;
+thread_local std::size_t t_counted             = 0;
+}  // namespace
+
+void set_counting_sql(const std::string* sql) noexcept
+{
+  t_counting_sql = sql;
+  t_counted      = 0;
+}
+const std::string* counting_sql() noexcept { return t_counting_sql; }
+std::size_t& counted_in_thread() noexcept { return t_counted; }
+
+std::size_t count_expected_shares(const std::string& sql, duckdb::LogicalOperator const& plan)
+{
+  std::size_t n = 0;
+  if (plan.type == duckdb::LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+    auto& cte = plan.Cast<duckdb::LogicalMaterializedCTE>();
+    auto const text = cte_share_key(sql, cte.ctename.GetIdentifierName());
+    if (text && share_key_allowed(*text)) {
+      auto const key = combine_share_key(*text, optimized_plan_signature(*cte.children[0]));
+      auto& r        = reg();
+      std::lock_guard lk(r.mu);
+      ++r.expected[key];
+      r.counted = true;
+      ++n;
+    }
+  }
+  for (auto& child : plan.children) {
+    n += count_expected_shares(sql, *child);
+  }
+  return n;
+}
+
+std::string optimized_plan_signature(duckdb::LogicalOperator const& op)
+{
+  std::string out = duckdb::LogicalOperatorToString(op.type) + "{";
+  for (auto const& kv : op.ParamsToString()) {
+    out += kv.first + "=" + kv.second + ";";
+  }
+  out += "types=";
+  for (auto const& t : op.types) {
+    out += t.ToString() + ",";
+  }
+  out += "}(";
+  for (auto const& child : op.children) {
+    out += optimized_plan_signature(*child) + ",";
+  }
+  return out + ")";
 }
 
 void note_shared_hit(std::uint64_t key, std::size_t bytes)

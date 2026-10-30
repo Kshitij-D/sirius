@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "duckdb/execution/column_binding_resolver.hpp"
+#include "memory/shared_results.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 
 #include "op/scan/table_scan/bound_read_view.hpp"
@@ -335,6 +337,16 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
     conn_state->set_captured_original_views(
       sirius::op::scan::capture_bound_read_views(*captured, context));
     conn_state->set_captured_plan(copy_logical_plan(*captured, context));
+    if (auto const* sql = sirius::memory::counting_sql()) {  // sirius_share_prepare pass
+      // Same steps create_plan applies to the captured copy before planning (types, then column
+      // bindings), so the counted signatures equal the ones seen at execution.
+      auto counted_copy = copy_logical_plan(*captured, context);
+      counted_copy->ResolveOperatorTypes();
+      duckdb::ColumnBindingResolver resolver;
+      resolver.VisitOperator(*counted_copy);
+      sirius::memory::counted_in_thread() +=
+        sirius::memory::count_expected_shares(*sql, *counted_copy);
+    }
   } catch (duckdb::NotImplementedException& e) {
     // Plan not serializable — skip GPU. Logged because a silent skip here is
     // indistinguishable from "GPU ran and was slow": the query still returns correct

@@ -83,7 +83,7 @@ std::unique_ptr<operator_data> sirius_physical_cte::execute(const operator_data&
 
 void sirius_physical_cte::sink(const operator_data& input_data, ::cuda::stream_ref stream)
 {
-  if (share_key != 0) {
+  if (share_key != 0 && !share_consumer) {
     auto const& batches =
       dynamic_cast<const pipelineable_operator_data&>(input_data).get_data_batches();
     std::lock_guard lk(_share_mu);
@@ -95,12 +95,15 @@ void sirius_physical_cte::sink(const operator_data& input_data, ::cuda::stream_r
 void sirius_physical_cte::on_finalize_operator()
 {
   if (share_key == 0) { return; }
-  std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
-  {
-    std::lock_guard lk(_share_mu);
-    batches.swap(_share_batches);
+  if (!share_consumer) {
+    std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
+    {
+      std::lock_guard lk(_share_mu);
+      batches.swap(_share_batches);
+    }
+    memory::publish_shared_result(share_key, std::move(batches), share_logical_types);
   }
-  memory::publish_shared_result(share_key, std::move(batches), share_logical_types);
+  memory::note_shared_cte_finished(share_key);
 }
 
 }  // namespace op
