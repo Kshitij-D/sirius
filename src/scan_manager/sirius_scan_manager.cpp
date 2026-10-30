@@ -15,6 +15,7 @@
  */
 
 #include "scan_manager/sirius_scan_manager.hpp"
+#include "memory/shared_uploads.hpp"
 #include "memory/resident_ledger.hpp"
 
 #include "compression/decompression_pushdown_policy.hpp"
@@ -298,7 +299,23 @@ struct cached_databatch_provider : public databatch_provider {
     // index; positions past the survivors yield the insert-delta splits.
     // The cursor hands out unique positions, so each split is moved out once.
     auto const cursor = _index.fetch_add(1);
-    if (cursor >= _plan.survivor_chunk_indices.size()) {
+    auto const n_surv = _plan.survivor_chunk_indices.size();
+    auto pos          = cursor;
+    if (cursor < n_surv && _entry.tier == cucascade::memory::Tier::HOST &&
+        sirius::memory::cooperative_start_enabled()) {
+      // Cooperative start (memory/shared_uploads.hpp): begin at the chunk other scans of this
+      // entry are uploading now and wrap around, so concurrent scans share uploads.
+      std::call_once(_rotate_once, [&] {
+        if (auto const hot = sirius::memory::hot_chunk(&_entry)) {
+          auto const& surv = _plan.survivor_chunk_indices;
+          _rotate = static_cast<std::size_t>(
+                      std::lower_bound(surv.begin(), surv.end(), *hot) - surv.begin()) %
+                    n_surv;
+        }
+      });
+      pos = (cursor + _rotate) % n_surv;
+    }
+    if (cursor >= n_surv) {
       auto const delta_idx = cursor - _plan.survivor_chunk_indices.size();
       if (delta_idx >= _delta_splits.size()) { return {}; }
       auto& delta = _delta_splits[delta_idx];
@@ -308,7 +325,7 @@ struct cached_databatch_provider : public databatch_provider {
       out.preferred_device = delta.preferred_device;
       return out;
     }
-    auto const index = _plan.survivor_chunk_indices[cursor];
+    auto const index = _plan.survivor_chunk_indices[pos];
     std::shared_ptr<cucascade::data_batch> data;
     if (_entry.tier == cucascade::memory::Tier::GPU) {
       data = get_device_databatch(index);
@@ -348,6 +365,9 @@ struct cached_databatch_provider : public databatch_provider {
       return cucascade::data_batch::make(get_next_batch_id(), std::move(projected));
     }
     auto& host          = chunk->cast<cucascade::host_data_representation>();
+    if (sirius::memory::shared_uploads_enabled()) {
+      sirius::memory::note_host_chunk(host.get_host_table()->allocation.get(), &_entry, index);
+    }
     auto data_rep       = host.slice(_column_indices);
     const auto batch_id = get_next_batch_id();
     return cucascade::data_batch::make(
@@ -610,6 +630,9 @@ struct cached_databatch_provider : public databatch_provider {
   /// batches pick up join filters as they are published mid-scan.
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> _dynamic_filters;
   std::atomic<std::size_t> _index{0};
+  //! Cooperative start offset into the survivor positions (host tier, shared uploads only).
+  std::once_flag _rotate_once;
+  std::size_t _rotate{0};
 };
 
 /// The scan's column primary index per served slot: @p selected_columns are

@@ -21,8 +21,10 @@
 
 #include <compression/decompression_pushdown_policy.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <log/logging.hpp>
+#include <memory/shared_uploads.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/decoded_batch_representation.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
@@ -303,8 +305,21 @@ void scan_operator_input::prepare_for_processing(
           snapshot_onto(host_rep);
         }
       }
-      mut.convert_to<::cucascade::gpu_table_representation>(
-        registry, requested_memory_space, stream);
+      // Shared uploads (memory/shared_uploads.hpp): an uncompressed host-tier chunk is served from
+      // device columns that other in-flight scans already uploaded; the view is read-only, so it is
+      // never stolen below.
+      bool shared_view = false;
+      if (sirius::memory::shared_uploads_enabled()) {
+        if (auto* host_rep = dynamic_cast<::cucascade::host_data_representation*>(mut.get_data())) {
+          mut.set_data(sirius::memory::shared_upload(
+            *host_rep, *const_cast<::cucascade::memory::memory_space*>(requested_memory_space)));
+          shared_view = true;
+        }
+      }
+      if (!shared_view) {
+        mut.convert_to<::cucascade::gpu_table_representation>(
+          registry, requested_memory_space, stream);
+      }
       record_decode_outcome(mut.get_data());
       // Conversion produces a fresh owned table for this split (raw GPU pins already use a plain
       // gpu_table_representation, so they never reach this branch), so a filter-free scan may
@@ -315,7 +330,7 @@ void scan_operator_input::prepare_for_processing(
       // built every replacement cast; a non-converting split can detach immediately because no
       // allocating GPU operation follows the take, so an OOM retry can never re-enter materialize
       // on a consumed split.
-      if (converted_table_transferable()) {
+      if (!shared_view && converted_table_transferable()) {
         if (auto* gpu_rep = dynamic_cast<::cucascade::gpu_table_representation*>(mut.get_data())) {
           auto& space        = gpu_rep->get_memory_space();
           stolen_table_bytes = gpu_rep->get_size_in_bytes();
