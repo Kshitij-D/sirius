@@ -19,6 +19,8 @@
 
 #include "op/sirius_physical_cte.hpp"
 
+#include "memory/shared_results.hpp"
+
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "telemetry/nvtx.hpp"
@@ -77,6 +79,28 @@ std::unique_ptr<operator_data> sirius_physical_cte::execute(const operator_data&
   nvtx_scoped_range nvtx_range{"sirius_physical_cte::execute"};
   return std::make_unique<pipelineable_operator_data>(
     dynamic_cast<const pipelineable_operator_data&>(input_data).get_data_batches());
+}
+
+void sirius_physical_cte::sink(const operator_data& input_data, ::cuda::stream_ref stream)
+{
+  if (share_key != 0) {
+    auto const& batches =
+      dynamic_cast<const pipelineable_operator_data&>(input_data).get_data_batches();
+    std::lock_guard lk(_share_mu);
+    _share_batches.insert(_share_batches.end(), batches.begin(), batches.end());
+  }
+  sirius_physical_operator::sink(input_data, stream);
+}
+
+void sirius_physical_cte::on_finalize_operator()
+{
+  if (share_key == 0) { return; }
+  std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
+  {
+    std::lock_guard lk(_share_mu);
+    batches.swap(_share_batches);
+  }
+  memory::publish_shared_result(share_key, std::move(batches), share_logical_types);
 }
 
 }  // namespace op

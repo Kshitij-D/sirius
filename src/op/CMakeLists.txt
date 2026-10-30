@@ -55,6 +55,7 @@ target_sources(
           sirius_physical_empty_result.cpp
           sirius_physical_filter.cpp
           sirius_physical_gpu_values.cpp
+          sirius_physical_shared_result_scan.cpp
           sirius_physical_grouped_aggregate.cpp
           sirius_physical_grouped_aggregate_merge.cpp
           sirius_physical_hash_join.cpp

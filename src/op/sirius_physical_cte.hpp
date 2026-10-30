@@ -20,6 +20,9 @@
 #include "duckdb/execution/physical_operator.hpp"
 #include "op/sirius_physical_operator.hpp"
 
+#include <cstdint>
+#include <mutex>
+
 namespace sirius {
 
 namespace pipeline {
@@ -53,6 +56,20 @@ class sirius_physical_cte : public sirius_physical_operator {
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
+
+  //! Cross-query sharing (memory/shared_results.hpp): nonzero = publish this CTE's result under
+  //! the key when its producing pipeline finishes.
+  std::uint64_t share_key = 0;
+  duckdb::vector<duckdb::LogicalType> share_logical_types;
+
+  void sink(const operator_data& input_data, ::cuda::stream_ref stream) override;
+
+ protected:
+  void on_finalize_operator() override;
+
+ private:
+  std::mutex _share_mu;
+  std::vector<std::shared_ptr<::cucascade::data_batch>> _share_batches;
 
  public:
   // Sink interface

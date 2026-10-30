@@ -17,7 +17,10 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
+#include "helper/type_conversions.hpp"
+#include "memory/shared_results.hpp"
 #include "op/sirius_physical_cte.hpp"
+#include "op/sirius_physical_shared_result_scan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
 namespace sirius::planner {
@@ -36,8 +39,36 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalMaterializedCTE& op)
   materialized_ctes[op.table_index] =
     duckdb::vector<duckdb::const_reference<sirius::op::sirius_physical_operator>>();
 
+  // Cross-query sharing (memory/shared_results.hpp): replay a result another query of the batch
+  // already published for this CTE body, or mark this CTE to publish its own.
+  std::uint64_t share_key = 0;
+  std::shared_ptr<const sirius::memory::shared_result> shared;
+  if (sirius::memory::sharing_enabled()) {
+    std::string sql;
+    try {
+      sql = context.GetCurrentQuery();
+    } catch (std::exception&) {
+      sql.clear();
+    }
+    auto const key = sirius::memory::cte_share_key(sql, op.ctename.GetIdentifierName());
+    if (key && sirius::memory::share_key_allowed(*key)) {
+      share_key = *key;
+      shared    = sirius::memory::find_shared_result(share_key);
+      if (shared && shared->logical_types != op.children[0]->types) { shared = nullptr; }
+    }
+  }
+
   // Create the plan for the left side. This is the materialization.
-  auto left = create_plan(*op.children[0]);
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> left;
+  if (shared) {
+    left = duckdb::make_uniq<sirius::op::sirius_physical_shared_result_scan>(
+      sirius::from_duckdb_vec(op.children[0]->types),
+      op.children[0]->estimated_cardinality,
+      shared,
+      share_key);
+  } else {
+    left = create_plan(*op.children[0]);
+  }
   // Initialize an empty vector to collect the scan operators.
   auto right = create_plan(*op.children[1]);
 
@@ -54,6 +85,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalMaterializedCTE& op)
   cte->working_table = working_table;
   // cte->working_table_gpu = working_table_gpu;
   cte->cte_scans = materialized_ctes[op.table_index];
+  if (share_key != 0 && !shared) {
+    cte->share_key           = share_key;
+    cte->share_logical_types = op.children[0]->types;
+  }
 
   return std::move(cte);
 }
