@@ -83,6 +83,10 @@ void set_counting_sql(const std::string* sql) noexcept;
 const std::string* counting_sql() noexcept;
 std::size_t& counted_in_thread() noexcept;
 
+/// The prepare pass finished: from now on counts decide publishing and release (entries already
+/// published whose counted consumers all finished are released at once).
+void share_prepare_done();
+
 /// A query's CTE with this key finished (computed or replayed): count it, release when done.
 void note_shared_cte_finished(std::uint64_t key);
 

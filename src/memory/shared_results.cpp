@@ -26,7 +26,8 @@ struct registry {
   std::unordered_map<std::uint64_t, std::shared_ptr<const shared_result>> published;
   std::unordered_set<std::uint64_t> refused;  // over budget: logged once
   // Batch counts (sirius_share_prepare): planned consumers per key, and consumers whose CTE
-  // finished. Without a prepare pass (counted == false) results are held to the process end.
+  // finished. Counts apply once the prepare pass reports done (counted == true); before that,
+  // results publish as without counts and are held.
   std::unordered_map<std::uint64_t, std::size_t> expected;
   std::unordered_map<std::uint64_t, std::size_t> served;
   bool counted = false;
@@ -310,7 +311,6 @@ std::size_t count_expected_shares(const std::string& sql, duckdb::LogicalOperato
       auto& r        = reg();
       std::lock_guard lk(r.mu);
       ++r.expected[key];
-      r.counted = true;
       ++n;
     }
   }
@@ -335,6 +335,27 @@ std::string optimized_plan_signature(duckdb::LogicalOperator const& op)
     out += optimized_plan_signature(*child) + ",";
   }
   return out + ")";
+}
+
+void share_prepare_done()
+{
+  auto& r = reg();
+  std::lock_guard lk(r.mu);
+  r.counted = true;
+  std::size_t released = 0;
+  for (auto it = r.published.begin(); it != r.published.end();) {
+    auto const key = it->first;
+    if (r.served[key] >= r.expected[key]) {  // no counted consumer left
+      sub_resident(it->second->space, it->second->bytes);
+      r.used -= it->second->bytes;
+      ++released;
+      it = r.published.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  std::fprintf(stderr, "[share] prepare done: %zu keys counted, %zu released at once, used=%zu\n",
+               r.expected.size(), released, r.used);
 }
 
 void note_shared_hit(std::uint64_t key, std::size_t bytes)

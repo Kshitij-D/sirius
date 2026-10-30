@@ -1649,6 +1649,28 @@ static void SiriusSharePrepareFunction(ClientContext& context,
   data.finished = true;
 }
 
+static unique_ptr<FunctionData> SiriusSharePrepareDoneBind(ClientContext& context,
+                                                           TableFunctionBindInput& input,
+                                                           vector<LogicalType>& return_types,
+                                                           vector<Identifier>& names)
+{
+  return_types.push_back(LogicalType::BOOLEAN);
+  names.push_back("ok");
+  return make_uniq<SiriusSharePrepareData>();
+}
+
+static void SiriusSharePrepareDoneFunction(ClientContext& context,
+                                           TableFunctionInput& data_p,
+                                           DataChunk& output)
+{
+  auto& data = data_p.bind_data->CastNoConst<SiriusSharePrepareData>();
+  if (data.finished) { return; }
+  sirius::memory::share_prepare_done();
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value::BOOLEAN(true));
+  data.finished = true;
+}
+
 struct CreateAnnIndexData : public TableFunctionData {
   std::string table_name;
   std::string column_name;
@@ -2422,6 +2444,11 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
                               SiriusSharePrepareBind);
   CreateTableFunctionInfo share_prepare_info(share_prepare);
   catalog.CreateTableFunction(transaction, share_prepare_info);
+
+  TableFunction share_prepare_done(
+    "sirius_share_prepare_done", {}, SiriusSharePrepareDoneFunction, SiriusSharePrepareDoneBind);
+  CreateTableFunctionInfo share_prepare_done_info(share_prepare_done);
+  catalog.CreateTableFunction(transaction, share_prepare_done_info);
 
   // Profiler control functions for nsys --capture-range=cudaProfilerApi
   TableFunction profiler_start(
