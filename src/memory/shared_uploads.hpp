@@ -18,12 +18,14 @@
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <string>
 
 namespace cucascade {
 class gpu_table_representation;
 class host_data_representation;
 namespace memory {
 class memory_space;
+struct column_metadata;
 }
 }  // namespace cucascade
 
@@ -38,6 +40,15 @@ bool cooperative_start_enabled() noexcept;
 /// Returns a view-backed representation whose owner keeps the shared columns alive.
 std::unique_ptr<::cucascade::gpu_table_representation> shared_upload(
   ::cucascade::host_data_representation& host, ::cucascade::memory::memory_space& space);
+
+/// Plan-driven retention (SIRIUS_SHARE_UPLOAD_POLICY=plan, reader counts per column name from the
+/// batch planner in SIRIUS_SHARE_UPLOAD_READERS): copies are kept for their remaining expected reads
+/// and the one with the fewest is evicted first. Column names identify columns across tables in
+/// TPC-DS (prefixed names); a general engine would key by table and column.
+bool plan_retention_enabled() noexcept;
+void note_host_column(const void* allocation,
+                      const ::cucascade::memory::column_metadata& column,
+                      const std::string& name);
 
 /// Remember that host allocation `allocation` is chunk `chunk_index` of pinned entry `entry`.
 void note_host_chunk(const void* allocation, const void* entry, std::size_t chunk_index);

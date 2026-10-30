@@ -367,6 +367,13 @@ struct cached_databatch_provider : public databatch_provider {
     auto& host          = chunk->cast<cucascade::host_data_representation>();
     if (sirius::memory::shared_uploads_enabled()) {
       sirius::memory::note_host_chunk(host.get_host_table()->allocation.get(), &_entry, index);
+      if (sirius::memory::plan_retention_enabled()) {
+        auto const& ht = host.get_host_table();
+        for (std::size_t j = 0; j < _column_indices.size(); ++j) {
+          sirius::memory::note_host_column(
+            ht->allocation.get(), ht->columns.at(_column_indices[j]), _column_names[j]);
+        }
+      }
     }
     auto data_rep       = host.slice(_column_indices);
     const auto batch_id = get_next_batch_id();
