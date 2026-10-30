@@ -16,6 +16,7 @@
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "helper/type_conversions.hpp"
 #include "memory/shared_results.hpp"

@@ -26,28 +26,31 @@ struct registry {
   bool on = false;
 };
 
+void load(registry& x)
+{
+  auto const* path = std::getenv("SIRIUS_SHARE_KEYS");
+  if (path == nullptr || *path == '\0') { return; }
+  std::ifstream in(path);
+  if (!in) {
+    std::fprintf(stderr, "[share] cannot read SIRIUS_SHARE_KEYS=%s; sharing off\n", path);
+    return;
+  }
+  std::string line;
+  while (std::getline(in, line)) {
+    if (!line.empty()) { x.allowed.insert(std::stoull(line, nullptr, 16)); }
+  }
+  if (auto const* b = std::getenv("SIRIUS_SHARE_BUDGET_BYTES"); b != nullptr && *b != '\0') {
+    x.budget = std::stoull(b);
+  }
+  x.on = true;
+  std::fprintf(stderr, "[share] on: %zu keys, budget %zu bytes\n", x.allowed.size(), x.budget);
+}
+
 registry& reg()
 {
-  static registry r = [] {
-    registry x;
-    auto const* path = std::getenv("SIRIUS_SHARE_KEYS");
-    if (path == nullptr || *path == '\0') { return x; }
-    std::ifstream in(path);
-    if (!in) {
-      std::fprintf(stderr, "[share] cannot read SIRIUS_SHARE_KEYS=%s; sharing off\n", path);
-      return x;
-    }
-    std::string line;
-    while (std::getline(in, line)) {
-      if (!line.empty()) { x.allowed.insert(std::stoull(line, nullptr, 16)); }
-    }
-    if (auto const* b = std::getenv("SIRIUS_SHARE_BUDGET_BYTES"); b != nullptr && *b != '\0') {
-      x.budget = std::stoull(b);
-    }
-    x.on = true;
-    std::fprintf(stderr, "[share] on: %zu keys, budget %zu bytes\n", x.allowed.size(), x.budget);
-    return x;
-  }();
+  static registry r;
+  static std::once_flag once;
+  std::call_once(once, [] { load(r); });
   return r;
 }
 
