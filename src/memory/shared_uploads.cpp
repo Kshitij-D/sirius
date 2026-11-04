@@ -17,7 +17,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <future>
+#include <chrono>
 #include <list>
+#include <map>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -100,6 +102,25 @@ struct cache {
   std::unordered_map<const void*, std::size_t> hot;             // entry -> last uploaded chunk
   std::unordered_map<column_key, entry, column_key_hash> entries;
   std::list<std::pair<column_key, std::shared_ptr<cudf::column>>> lru;  // retained copies
+  // SIRIUS_SHARE_UPLOAD_POLICY=lru: a hit moves the copy to the back (true LRU). Default: insertion order (FIFO).
+  bool true_lru = false;
+  std::unordered_map<column_key, std::list<std::pair<column_key, std::shared_ptr<cudf::column>>>::iterator,
+                     column_key_hash>
+    lru_pos;
+  std::map<std::pair<const void*, std::size_t>, std::size_t> retained_by_chunk;  // (entry, chunk) -> bytes
+  std::atomic<std::uint64_t> rf_picks{0}, rf_resident{0};
+  // SIRIUS_SHARE_TRACE=<file>: one line per column read (t_ns event entry chunk layout bytes), written at exit.
+  bool trace = false;
+  std::string trace_path;
+  struct trace_rec {
+    std::uint64_t t_ns;
+    char ev;  // U upload, H hit, W wait
+    const void* entry;
+    long long chunk;
+    std::uint64_t layout;
+    std::uint64_t bytes;
+  };
+  std::vector<trace_rec> trace_log;
   std::size_t retained_bytes = 0;
   std::size_t budget         = 0;
   std::atomic<std::uint64_t> uploads{0}, hits{0}, waits{0}, bytes_uploaded{0}, bytes_hit{0};
@@ -125,6 +146,15 @@ cache& the_cache()
       std::fprintf(stderr, "[share-upload] plan policy: %zu columns with reader counts, budget %zu\n",
                    x->expected_readers.size(), x->budget);
     }
+    if (auto const* pol = std::getenv("SIRIUS_SHARE_UPLOAD_POLICY"); pol != nullptr && std::string(pol) == "lru") {
+      x->true_lru = true;
+      std::fprintf(stderr, "[share-upload] true LRU policy, budget %zu\n", x->budget);
+    }
+    if (auto const* t = std::getenv("SIRIUS_SHARE_TRACE"); t != nullptr && *t != '\0') {
+      x->trace      = true;
+      x->trace_path = t;
+      x->trace_log.reserve(1 << 20);
+    }
     std::atexit([] {
       auto& y = the_cache();
       std::fprintf(stderr,
@@ -139,19 +169,69 @@ cache& the_cache()
                    static_cast<unsigned long long>(y.plan_released.load()),
                    static_cast<unsigned long long>(y.plan_evicted.load()),
                    static_cast<unsigned long long>(y.plan_skipped.load()));
+      std::fprintf(stderr, "[share-upload] resident_first picks=%llu resident=%llu true_lru=%d\n",
+                   static_cast<unsigned long long>(y.rf_picks.load()),
+                   static_cast<unsigned long long>(y.rf_resident.load()), y.true_lru ? 1 : 0);
+      if (y.trace) {
+        std::lock_guard lk(y.mu);
+        if (std::FILE* f = std::fopen(y.trace_path.c_str(), "w")) {
+          for (auto const& r : y.trace_log) {
+            std::fprintf(f, "%llu %c %p %lld %llu %llu\n", static_cast<unsigned long long>(r.t_ns), r.ev, r.entry,
+                         r.chunk, static_cast<unsigned long long>(r.layout), static_cast<unsigned long long>(r.bytes));
+          }
+          std::fclose(f);
+        }
+      }
     });
     return x;
   }();
   return *c;
 }
 
+// Retained bytes of the chunk that host allocation `allocation` belongs to (resident-first order).
+void chunk_adjust(cache& c, const void* allocation, std::size_t bytes, bool add)
+{
+  auto pl = c.chunk_of.find(allocation);
+  if (pl == c.chunk_of.end()) { return; }
+  auto& v = c.retained_by_chunk[{pl->second.entry, pl->second.index}];
+  v       = add ? v + bytes : (v > bytes ? v - bytes : 0);
+}
+
+void trace_read(cache& c, const column_key& key, char ev, std::size_t bytes)
+{
+  if (!c.trace) { return; }
+  auto pl = c.chunk_of.find(key.allocation);
+  auto const t = static_cast<std::uint64_t>(
+    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+  c.trace_log.push_back(cache::trace_rec{t,
+                                         ev,
+                                         pl == c.chunk_of.end() ? nullptr : pl->second.entry,
+                                         pl == c.chunk_of.end() ? -1LL : static_cast<long long>(pl->second.index),
+                                         key.layout,
+                                         bytes});
+}
+
+// True LRU: a hit makes the retained copy the most recent.
+void lru_touch(cache& c, const column_key& key)
+{
+  if (!c.true_lru) { return; }
+  auto it = c.lru_pos.find(key);
+  if (it != c.lru_pos.end()) { c.lru.splice(c.lru.end(), c.lru, it->second); }
+}
+
 void retain(cache& c, const column_key& key, const std::shared_ptr<cudf::column>& col)
 {
   if (c.budget == 0) { return; }
+  if (c.lru_pos.count(key) != 0) { return; }
   c.lru.emplace_back(key, col);
+  c.lru_pos[key] = std::prev(c.lru.end());
   c.retained_bytes += col->alloc_size();
+  chunk_adjust(c, key.allocation, col->alloc_size(), true);
   while (c.retained_bytes > c.budget && !c.lru.empty()) {
-    c.retained_bytes -= c.lru.front().second->alloc_size();
+    auto const& front = c.lru.front();
+    c.retained_bytes -= front.second->alloc_size();
+    chunk_adjust(c, front.first.allocation, front.second->alloc_size(), false);
+    c.lru_pos.erase(front.first);
     c.lru.pop_front();
   }
 }
@@ -160,6 +240,7 @@ void plan_drop(cache& c, std::unordered_map<column_key, planned_slot, column_key
 {
   c.plan_index.erase(plan_order{it->second.remaining, it->second.seq, it->first.allocation, it->first.layout});
   c.retained_bytes -= it->second.column->alloc_size();
+  chunk_adjust(c, it->first.allocation, it->second.column->alloc_size(), false);
   c.planned.erase(it);
 }
 
@@ -171,6 +252,7 @@ void plan_read(cache& c, const column_key& key)
   c.plan_index.erase(plan_order{it->second.remaining, it->second.seq, key.allocation, key.layout});
   if (--it->second.remaining <= 0) {
     c.retained_bytes -= it->second.column->alloc_size();
+    chunk_adjust(c, key.allocation, it->second.column->alloc_size(), false);
     c.planned.erase(it);
     c.plan_released.fetch_add(1, std::memory_order_relaxed);
     return;
@@ -204,6 +286,7 @@ void plan_retain(cache& c, const column_key& key, const std::shared_ptr<cudf::co
   c.planned[key] = planned_slot{col, remaining, seq};
   c.plan_index.insert(plan_order{remaining, seq, key.allocation, key.layout});
   c.retained_bytes += bytes;
+  chunk_adjust(c, key.allocation, bytes, true);
 }
 
 std::shared_ptr<cudf::column> upload_one(::cucascade::host_data_representation& host,
@@ -240,6 +323,8 @@ std::shared_ptr<cudf::column> acquire(cache& c,
           c.hits.fetch_add(1, std::memory_order_relaxed);
           c.bytes_hit.fetch_add(col->alloc_size(), std::memory_order_relaxed);
           if (c.plan_policy) { plan_read(c, key); }
+          lru_touch(c, key);
+          trace_read(c, key, 'H', col->alloc_size());
           return col;
         }
         if (it->second.pending.valid()) {
@@ -249,9 +334,11 @@ std::shared_ptr<cudf::column> acquire(cache& c,
             c.waits.fetch_add(1, std::memory_order_relaxed);
             c.hits.fetch_add(1, std::memory_order_relaxed);
             c.bytes_hit.fetch_add(col->alloc_size(), std::memory_order_relaxed);
-            if (c.plan_policy) {
+            {
               std::lock_guard relk(c.mu);
-              plan_read(c, key);
+              if (c.plan_policy) { plan_read(c, key); }
+              lru_touch(c, key);
+              trace_read(c, key, 'W', col->alloc_size());
             }
             return col;
           }
@@ -285,6 +372,7 @@ std::shared_ptr<cudf::column> acquire(cache& c,
     auto& e   = c.entries[key];
     e.column  = col;
     e.pending = {};
+    trace_read(c, key, 'U', col->alloc_size());
     if (c.plan_policy) {
       plan_retain(c, key, col);
     } else {
@@ -348,6 +436,35 @@ void note_host_chunk(const void* allocation, const void* entry, std::size_t chun
   auto& c = the_cache();
   std::lock_guard lk(c.mu);
   c.chunk_of[allocation] = chunk_place{entry, chunk_index};
+}
+
+bool resident_first_enabled() noexcept
+{
+  static bool const on = [] {
+    auto const* v = std::getenv("SIRIUS_SHARE_RESIDENT_FIRST");
+    return shared_uploads_enabled() && v != nullptr && *v == '1';
+  }();
+  return on;
+}
+
+std::vector<std::size_t> retained_bytes_by_chunk(const void* entry, std::size_t chunk_count)
+{
+  auto& c = the_cache();
+  std::vector<std::size_t> out(chunk_count, 0);
+  std::lock_guard lk(c.mu);
+  for (auto it = c.retained_by_chunk.lower_bound({entry, 0});
+       it != c.retained_by_chunk.end() && it->first.first == entry;
+       ++it) {
+    if (it->first.second < chunk_count) { out[it->first.second] = it->second; }
+  }
+  return out;
+}
+
+void note_resident_first_pick(bool resident) noexcept
+{
+  auto& c = the_cache();
+  c.rf_picks.fetch_add(1, std::memory_order_relaxed);
+  if (resident) { c.rf_resident.fetch_add(1, std::memory_order_relaxed); }
 }
 
 std::optional<std::size_t> hot_chunk(const void* entry)

@@ -298,8 +298,11 @@ struct cached_databatch_provider : public databatch_provider {
     // The atomic cursor walks survivor positions, each mapping to a chunk
     // index; positions past the survivors yield the insert-delta splits.
     // The cursor hands out unique positions, so each split is moved out once.
-    auto const cursor = _index.fetch_add(1);
     auto const n_surv = _plan.survivor_chunk_indices.size();
+    if (_entry.tier == cucascade::memory::Tier::HOST && sirius::memory::resident_first_enabled()) {
+      return get_next_batch_resident_first(n_surv);
+    }
+    auto const cursor = _index.fetch_add(1);
     auto pos          = cursor;
     if (cursor < n_surv && _entry.tier == cucascade::memory::Tier::HOST &&
         sirius::memory::cooperative_start_enabled()) {
@@ -315,6 +318,51 @@ struct cached_databatch_provider : public databatch_provider {
       });
       pos = (cursor + _rotate) % n_surv;
     }
+    return serve(cursor, pos, n_surv);
+  }
+
+  /// Resident-first order (memory/shared_uploads.hpp): among the survivor positions not yet taken, the one whose
+  /// chunk has the most retained device bytes; ties keep the cooperative-start rotation order.
+  databatch_provider::batch get_next_batch_resident_first(std::size_t n_surv)
+  {
+    std::size_t pos = 0;
+    bool have       = false;
+    {
+      std::lock_guard lk(_rf_mu);
+      if (_rf_taken.size() != n_surv) {
+        _rf_taken.assign(n_surv, false);
+        if (auto const hot = sirius::memory::hot_chunk(&_entry); hot && n_surv > 0) {
+          auto const& surv = _plan.survivor_chunk_indices;
+          _rotate = static_cast<std::size_t>(std::lower_bound(surv.begin(), surv.end(), *hot) - surv.begin()) %
+                    n_surv;
+        }
+      }
+      if (_rf_count < n_surv) {
+        auto const by_chunk = sirius::memory::retained_bytes_by_chunk(&_entry, _entry.host_chunks.size());
+        std::size_t best_bytes = 0;
+        for (std::size_t k = 0; k < n_surv; ++k) {
+          auto const p = (k + _rotate) % n_surv;
+          if (_rf_taken[p]) { continue; }
+          auto const idx = _plan.survivor_chunk_indices[p];
+          auto const b   = idx < by_chunk.size() ? by_chunk[idx] : 0;
+          if (!have || b > best_bytes) {
+            pos        = p;
+            best_bytes = b;
+            have       = true;
+          }
+        }
+        _rf_taken[pos] = true;
+        ++_rf_count;
+        sirius::memory::note_resident_first_pick(best_bytes > 0);
+      }
+    }
+    if (have) { return serve(pos, pos, n_surv); }
+    return serve(n_surv + _rf_delta.fetch_add(1), 0, n_surv);
+  }
+
+  /// Serve survivor position @p pos when @p cursor < @p n_surv, else insert-delta split cursor - n_surv.
+  databatch_provider::batch serve(std::size_t cursor, std::size_t pos, std::size_t n_surv)
+  {
     if (cursor >= n_surv) {
       auto const delta_idx = cursor - _plan.survivor_chunk_indices.size();
       if (delta_idx >= _delta_splits.size()) { return {}; }
@@ -640,6 +688,11 @@ struct cached_databatch_provider : public databatch_provider {
   //! Cooperative start offset into the survivor positions (host tier, shared uploads only).
   std::once_flag _rotate_once;
   std::size_t _rotate{0};
+  //! Resident-first order state (SIRIUS_SHARE_RESIDENT_FIRST=1).
+  std::mutex _rf_mu;
+  std::vector<bool> _rf_taken;
+  std::size_t _rf_count{0};
+  std::atomic<std::size_t> _rf_delta{0};
 };
 
 /// The scan's column primary index per served slot: @p selected_columns are

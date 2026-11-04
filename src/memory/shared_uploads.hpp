@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace cucascade {
 class gpu_table_representation;
@@ -55,5 +56,16 @@ void note_host_chunk(const void* allocation, const void* entry, std::size_t chun
 
 /// The chunk of `entry` most recently uploaded by any scan, if one was.
 std::optional<std::size_t> hot_chunk(const void* entry);
+
+/// Resident-first chunk order (SIRIUS_SHARE_RESIDENT_FIRST=1, needs shared uploads): a host-tier scan takes next the
+/// chunk with the most retained device bytes among the chunks it has not taken, so concurrent scans read what is
+/// already on the device before uploading more. Chunk order carries no meaning for a scan (as for cooperative start).
+bool resident_first_enabled() noexcept;
+
+/// Retained device bytes per chunk index of `entry` (size `chunk_count`), for resident-first selection.
+std::vector<std::size_t> retained_bytes_by_chunk(const void* entry, std::size_t chunk_count);
+
+/// Count one resident-first pick (`resident` = the chosen chunk had retained bytes).
+void note_resident_first_pick(bool resident) noexcept;
 
 }  // namespace sirius::memory
