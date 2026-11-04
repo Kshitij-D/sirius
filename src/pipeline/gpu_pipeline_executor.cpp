@@ -17,6 +17,7 @@
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/sched_policy.hpp"
 #include "memory/resident_ledger.hpp"
+#include "memory/shared_uploads.hpp"
 
 #include "creator/task_creator.hpp"
 #include "cucascade/memory/stream_pool.hpp"
@@ -250,10 +251,15 @@ void gpu_pipeline_executor::process_task(
     // Ledger (SIRIUS_LEDGER): resident pinned bytes can never be reserved, so the most any
     // request can be granted is the limit minus resident bytes. Capping there keeps every request
     // satisfiable once other reservations drain.
+    // Elastic retention: retained shared-upload copies are resident but give way on refusal, so they do not cap grants.
+    auto const resident_fixed =
+      memory::resident_bytes(_memory_space) -
+      (memory::elastic_enabled()
+         ? std::min(memory::resident_bytes(_memory_space), memory::retained_bytes())
+         : std::size_t{0});
     auto const grantable =
       memory::cap_resident_enabled()
-        ? _memory_space->get_max_memory() -
-            std::min(_memory_space->get_max_memory(), memory::resident_bytes(_memory_space))
+        ? _memory_space->get_max_memory() - std::min(_memory_space->get_max_memory(), resident_fixed)
         : _memory_space->get_max_memory();
     // Ledger shrink: a task refused for longer than SIRIUS_LEDGER_SHRINK_MS (default 1000) asks
     // only for what the accounting can grant now and borrows the rest from the real pool
@@ -304,6 +310,7 @@ void gpu_pipeline_executor::process_task(
           }
         }
       }
+      if (want > bytes_needs && memory::elastic_enabled()) { memory::reclaim_retained(want - bytes_needs); }
       if (want > bytes_needs && _downgrade_executor && !_pending_reclamation.valid() &&
           now >= _next_reclamation) {
         _pending_reclamation = _downgrade_executor->request_reservation_capacity(want);
@@ -314,6 +321,10 @@ void gpu_pipeline_executor::process_task(
     }
     if (!reservation || reservation->size() < bytes_needs) {
       reservation.reset();
+      if (memory::elastic_enabled()) {  // retained copies give way before the task waits
+        auto const headroom = memory::gpu_reservation_headroom(*_memory_space);
+        if (bytes_needs > headroom) { memory::reclaim_retained(bytes_needs - headroom); }
+      }
       const auto now = std::chrono::steady_clock::now();
       if (!pipeline_task->memory_wait.waiting()) {
         pipeline_task->memory_wait_activity = _query_lifecycle.begin_memory_wait(query_id);
@@ -494,6 +505,9 @@ void gpu_pipeline_executor::process_task(
               ex.get_resume_operator_index(),
               ex.what());
 
+            if (memory::elastic_enabled() && dynamic_cast<oom_reschedule_exception*>(&ex)) {
+              memory::reclaim_retained(std::size_t{2} << 30);  // an OOM: give back 2 GiB of retained copies
+            }
             auto intermediate_data = ex.release_intermediate_data();
             if (auto pipelineable_data =
                   dynamic_cast<op::pipelineable_operator_data*>(intermediate_data.get())) {

@@ -65,6 +65,15 @@ bool resident_first_enabled() noexcept;
 /// Retained device bytes per chunk index of `entry` (size `chunk_count`), for resident-first selection.
 std::vector<std::size_t> retained_bytes_by_chunk(const void* entry, std::size_t chunk_count);
 
+/// Elastic retention (SIRIUS_SHARE_ELASTIC=1, needs shared uploads): retained copies are the first memory to give way.
+bool elastic_enabled() noexcept;
+
+/// Drop retained copies no scan holds until about `bytes` are freed (pressure event); returns the bytes dropped.
+std::size_t reclaim_retained(std::size_t bytes);
+
+/// Bytes of retained copies (charged as resident; reclaimable under the elastic policy).
+std::size_t retained_bytes() noexcept;
+
 /// Count one resident-first pick (`resident` = the chosen chunk had retained bytes).
 void note_resident_first_pick(bool resident) noexcept;
 

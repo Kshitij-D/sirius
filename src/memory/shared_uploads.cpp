@@ -109,6 +109,12 @@ struct cache {
     lru_pos;
   std::map<std::pair<const void*, std::size_t>, std::size_t> retained_by_chunk;  // (entry, chunk) -> bytes
   std::atomic<std::uint64_t> rf_picks{0}, rf_resident{0};
+  // SIRIUS_SHARE_ELASTIC=1: retained copies give way to working memory (see shared_uploads.hpp).
+  bool elastic = false;
+  std::size_t margin = std::size_t{1} << 30;
+  std::chrono::steady_clock::time_point last_pressure{};
+  std::atomic<std::size_t> retained_atomic{0};
+  std::atomic<std::uint64_t> reclaim_events{0}, reclaimed_bytes{0}, elastic_skips{0};
   // SIRIUS_SHARE_TRACE=<file>: one line per column read (t_ns event entry chunk layout bytes), written at exit.
   bool trace = false;
   std::string trace_path;
@@ -150,6 +156,12 @@ cache& the_cache()
       x->true_lru = true;
       std::fprintf(stderr, "[share-upload] true LRU policy, budget %zu\n", x->budget);
     }
+    if (auto const* e = std::getenv("SIRIUS_SHARE_ELASTIC"); e != nullptr && *e == '1') {
+      x->elastic = true;
+      // SIRIUS_SHARE_ELASTIC_NOMARGIN=1: HeavyDB-style (working memory evicts cache on demand, no admission margin).
+      if (auto const* nm = std::getenv("SIRIUS_SHARE_ELASTIC_NOMARGIN"); nm != nullptr && *nm == '1') { x->margin = 0; }
+      std::fprintf(stderr, "[share-upload] elastic retention, cap %zu, margin %zu\n", x->budget, x->margin);
+    }
     if (auto const* t = std::getenv("SIRIUS_SHARE_TRACE"); t != nullptr && *t != '\0') {
       x->trace      = true;
       x->trace_path = t;
@@ -169,6 +181,10 @@ cache& the_cache()
                    static_cast<unsigned long long>(y.plan_released.load()),
                    static_cast<unsigned long long>(y.plan_evicted.load()),
                    static_cast<unsigned long long>(y.plan_skipped.load()));
+      std::fprintf(stderr, "[share-upload] elastic=%d reclaim_events=%llu reclaimed_bytes=%llu skips=%llu margin=%zu\n",
+                   y.elastic ? 1 : 0, static_cast<unsigned long long>(y.reclaim_events.load()),
+                   static_cast<unsigned long long>(y.reclaimed_bytes.load()),
+                   static_cast<unsigned long long>(y.elastic_skips.load()), y.margin);
       std::fprintf(stderr, "[share-upload] resident_first picks=%llu resident=%llu true_lru=%d\n",
                    static_cast<unsigned long long>(y.rf_picks.load()),
                    static_cast<unsigned long long>(y.rf_resident.load()), y.true_lru ? 1 : 0);
@@ -191,6 +207,7 @@ cache& the_cache()
 // Retained bytes of the chunk that host allocation `allocation` belongs to (resident-first order).
 void chunk_adjust(cache& c, const void* allocation, std::size_t bytes, bool add)
 {
+  c.retained_atomic.store(c.retained_bytes, std::memory_order_relaxed);
   auto pl = c.chunk_of.find(allocation);
   if (pl == c.chunk_of.end()) { return; }
   auto& v = c.retained_by_chunk[{pl->second.entry, pl->second.index}];
@@ -209,6 +226,20 @@ void trace_read(cache& c, const column_key& key, char ev, std::size_t bytes)
                                          pl == c.chunk_of.end() ? -1LL : static_cast<long long>(pl->second.index),
                                          key.layout,
                                          bytes});
+}
+
+// Elastic admission: keep `margin` free on the device after retaining `bytes`; the margin halves after 30 s quiet.
+bool elastic_admit(cache& c, std::size_t bytes, std::size_t available)
+{
+  if (!c.elastic || c.margin == 0) { return true; }
+  auto const now = std::chrono::steady_clock::now();
+  if (c.margin > (std::size_t{1} << 30) && now - c.last_pressure > std::chrono::seconds(30)) {
+    c.margin /= 2;
+    c.last_pressure = now;
+  }
+  if (available >= bytes + c.margin) { return true; }
+  c.elastic_skips.fetch_add(1, std::memory_order_relaxed);
+  return false;
 }
 
 // True LRU: a hit makes the retained copy the most recent.
@@ -364,6 +395,7 @@ std::shared_ptr<cudf::column> acquire(cache& c,
   }
   c.uploads.fetch_add(1, std::memory_order_relaxed);
   c.bytes_uploaded.fetch_add(col->alloc_size(), std::memory_order_relaxed);
+  auto const available = c.elastic ? space.get_available_memory() : std::size_t{0};
   {
     std::lock_guard lk(c.mu);
     if (auto pl = c.chunk_of.find(key.allocation); pl != c.chunk_of.end()) {
@@ -373,7 +405,9 @@ std::shared_ptr<cudf::column> acquire(cache& c,
     e.column  = col;
     e.pending = {};
     trace_read(c, key, 'U', col->alloc_size());
-    if (c.plan_policy) {
+    if (!elastic_admit(c, col->alloc_size(), available)) {
+      // not retained: the copy lives while its scans hold it
+    } else if (c.plan_policy) {
       plan_retain(c, key, col);
     } else {
       retain(c, key, col);
@@ -458,6 +492,48 @@ std::vector<std::size_t> retained_bytes_by_chunk(const void* entry, std::size_t 
     if (it->first.second < chunk_count) { out[it->first.second] = it->second; }
   }
   return out;
+}
+
+bool elastic_enabled() noexcept
+{
+  static bool const on = shared_uploads_enabled() && the_cache().elastic;
+  return on;
+}
+
+std::size_t retained_bytes() noexcept { return the_cache().retained_atomic.load(std::memory_order_relaxed); }
+
+std::size_t reclaim_retained(std::size_t bytes)
+{
+  auto& c = the_cache();
+  std::lock_guard lk(c.mu);
+  if (c.margin != 0) { c.margin = std::min(c.margin * 2, std::size_t{16} << 30); }
+  c.last_pressure = std::chrono::steady_clock::now();
+  c.reclaim_events.fetch_add(1, std::memory_order_relaxed);
+  std::size_t freed = 0;
+  if (c.plan_policy) {
+    for (auto it = c.plan_index.begin(); it != c.plan_index.end() && freed < bytes;) {
+      auto slot = c.planned.find(column_key{std::get<2>(*it), std::get<3>(*it)});
+      ++it;
+      if (slot == c.planned.end() || slot->second.column.use_count() > 1) { continue; }  // a scan holds it
+      freed += slot->second.column->alloc_size();
+      plan_drop(c, slot);
+    }
+  } else {
+    for (auto it = c.lru.begin(); it != c.lru.end() && freed < bytes;) {
+      if (it->second.use_count() > 1) {
+        ++it;
+        continue;
+      }
+      auto const sz = it->second->alloc_size();
+      freed += sz;
+      c.retained_bytes -= sz;
+      chunk_adjust(c, it->first.allocation, sz, false);
+      c.lru_pos.erase(it->first);
+      it = c.lru.erase(it);
+    }
+  }
+  c.reclaimed_bytes.fetch_add(freed, std::memory_order_relaxed);
+  return freed;
 }
 
 void note_resident_first_pick(bool resident) noexcept
