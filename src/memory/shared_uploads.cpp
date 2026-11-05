@@ -130,7 +130,7 @@ struct cache {
   std::condition_variable pf_cv;
   std::deque<std::unique_ptr<::cucascade::host_data_representation>> pf_queue;
   std::once_flag pf_start;
-  std::atomic<std::uint64_t> pf_uploads{0}, pf_bytes{0}, pf_present{0}, pf_skipped{0}, pf_dropped{0};
+  std::atomic<std::uint64_t> pf_uploads{0}, pf_bytes{0}, pf_present{0}, pf_skipped{0}, pf_dropped{0}, pf_reclaimed{0};
   std::unordered_map<column_key, std::list<std::pair<column_key, std::shared_ptr<cudf::column>>>::iterator,
                      column_key_hash>
     lru_pos;
@@ -224,12 +224,13 @@ cache& the_cache()
       std::fprintf(stderr, "[share-upload] resident_first picks=%llu resident=%llu true_lru=%d\n",
                    static_cast<unsigned long long>(y.rf_picks.load()),
                    static_cast<unsigned long long>(y.rf_resident.load()), y.true_lru ? 1 : 0);
-      std::fprintf(stderr, "[share-upload] prefetch=%d uploads=%llu bytes=%llu present=%llu skipped=%llu dropped=%llu\n",
+      std::fprintf(stderr, "[share-upload] prefetch=%d uploads=%llu bytes=%llu present=%llu skipped=%llu dropped=%llu reclaimed=%llu\n",
                    y.prefetch ? 1 : 0, static_cast<unsigned long long>(y.pf_uploads.load()),
                    static_cast<unsigned long long>(y.pf_bytes.load()),
                    static_cast<unsigned long long>(y.pf_present.load()),
                    static_cast<unsigned long long>(y.pf_skipped.load()),
-                   static_cast<unsigned long long>(y.pf_dropped.load()));
+                   static_cast<unsigned long long>(y.pf_dropped.load()),
+                   static_cast<unsigned long long>(y.pf_reclaimed.load()));
       std::fprintf(stderr, "[share-upload] nextuse=%d evicted=%llu skipped=%llu\n", y.nextuse ? 1 : 0,
                    static_cast<unsigned long long>(y.nu_evicted.load()),
                    static_cast<unsigned long long>(y.nu_skipped.load()));
@@ -519,6 +520,48 @@ std::shared_ptr<cudf::column> acquire(cache& c,
   return col;
 }
 
+// Drop retained copies no scan holds, lowest priority first under the active policy, until about
+// `bytes` are freed; c.mu held. Shared by memory pressure (reclaim_retained) and upload-ahead.
+std::size_t reclaim_locked(cache& c, std::size_t bytes)
+{
+  std::size_t freed = 0;
+  if (c.nextuse) {
+    // Farthest next read first (ties: least recently used first).
+    std::vector<std::pair<std::size_t, std::list<std::pair<column_key, std::shared_ptr<cudf::column>>>::iterator>> order;
+    std::size_t rank = 0;
+    for (auto it = c.lru.begin(); it != c.lru.end(); ++it, ++rank) { order.emplace_back(next_use(c, it->first), it); }
+    std::stable_sort(order.begin(), order.end(), [](auto const& a, auto const& b) { return a.first > b.first; });
+    for (auto& [d, it] : order) {
+      if (freed >= bytes) { break; }
+      if (it->second.use_count() > 1) { continue; }  // a scan holds it
+      freed += it->second->alloc_size();
+      drop_lru(c, it);
+    }
+  } else if (c.plan_policy) {
+    for (auto it = c.plan_index.begin(); it != c.plan_index.end() && freed < bytes;) {
+      auto slot = c.planned.find(column_key{std::get<2>(*it), std::get<3>(*it)});
+      ++it;
+      if (slot == c.planned.end() || slot->second.column.use_count() > 1) { continue; }  // a scan holds it
+      freed += slot->second.column->alloc_size();
+      plan_drop(c, slot);
+    }
+  } else {
+    for (auto it = c.lru.begin(); it != c.lru.end() && freed < bytes;) {
+      if (it->second.use_count() > 1) {
+        ++it;
+        continue;
+      }
+      auto const sz = it->second->alloc_size();
+      freed += sz;
+      c.retained_bytes -= sz;
+      chunk_adjust(c, it->first.allocation, sz, false);
+      c.lru_pos.erase(it->first);
+      it = c.lru.erase(it);
+    }
+  }
+  return freed;
+}
+
 std::size_t host_bytes(const ::cucascade::memory::column_metadata& m)
 {
   std::size_t b = (m.has_data ? m.data_size : 0) + (m.has_null_mask ? m.null_mask_size : 0);
@@ -548,9 +591,16 @@ void prefetch_one(cache& c, ::cucascade::host_data_representation& host, std::si
         return;
       }
     }
-    if (space->get_available_memory() < host_bytes(table->columns.at(i)) + (std::size_t{2} << 30)) {
-      c.pf_skipped.fetch_add(1, std::memory_order_relaxed);
-      return;
+    // Make room the way an upload by the scan itself would: drop the lowest-priority retained copies
+    // (not a pressure event: the admission margin is unchanged). E94 s28: without this the elastic
+    // cache kept the device full and no prefetch ever ran.
+    auto const need = host_bytes(table->columns.at(i)) + (std::size_t{2} << 30);
+    if (auto const avail = space->get_available_memory(); avail < need) {
+      c.pf_reclaimed.fetch_add(reclaim_locked(c, need - avail), std::memory_order_relaxed);
+      if (space->get_available_memory() < need) {
+        c.pf_skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
     }
     auto& e      = c.entries[key];
     e.allocation = std::shared_ptr<const void>(table->allocation, table->allocation.get());
@@ -753,41 +803,7 @@ std::size_t reclaim_retained(std::size_t bytes)
   if (c.margin != 0) { c.margin = std::min(c.margin * 2, std::size_t{16} << 30); }
   c.last_pressure = std::chrono::steady_clock::now();
   c.reclaim_events.fetch_add(1, std::memory_order_relaxed);
-  std::size_t freed = 0;
-  if (c.nextuse) {
-    // Farthest next read first (ties: least recently used first).
-    std::vector<std::pair<std::size_t, std::list<std::pair<column_key, std::shared_ptr<cudf::column>>>::iterator>> order;
-    std::size_t rank = 0;
-    for (auto it = c.lru.begin(); it != c.lru.end(); ++it, ++rank) { order.emplace_back(next_use(c, it->first), it); }
-    std::stable_sort(order.begin(), order.end(), [](auto const& a, auto const& b) { return a.first > b.first; });
-    for (auto& [d, it] : order) {
-      if (freed >= bytes) { break; }
-      if (it->second.use_count() > 1) { continue; }  // a scan holds it
-      freed += it->second->alloc_size();
-      drop_lru(c, it);
-    }
-  } else if (c.plan_policy) {
-    for (auto it = c.plan_index.begin(); it != c.plan_index.end() && freed < bytes;) {
-      auto slot = c.planned.find(column_key{std::get<2>(*it), std::get<3>(*it)});
-      ++it;
-      if (slot == c.planned.end() || slot->second.column.use_count() > 1) { continue; }  // a scan holds it
-      freed += slot->second.column->alloc_size();
-      plan_drop(c, slot);
-    }
-  } else {
-    for (auto it = c.lru.begin(); it != c.lru.end() && freed < bytes;) {
-      if (it->second.use_count() > 1) {
-        ++it;
-        continue;
-      }
-      auto const sz = it->second->alloc_size();
-      freed += sz;
-      c.retained_bytes -= sz;
-      chunk_adjust(c, it->first.allocation, sz, false);
-      c.lru_pos.erase(it->first);
-      it = c.lru.erase(it);
-    }
-  }
+  auto const freed = reclaim_locked(c, bytes);
   c.reclaimed_bytes.fetch_add(freed, std::memory_order_relaxed);
   return freed;
 }
