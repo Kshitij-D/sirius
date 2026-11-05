@@ -95,4 +95,11 @@ std::uint64_t register_scan(const void* entry,
                             const std::size_t* rotate);
 void unregister_scan(std::uint64_t id);
 
+/// Upload-ahead (SIRIUS_SHARE_PREFETCH=1, ROADMAP B2): a host-tier scan hands over the next chunk it
+/// will take (projected to its columns); one background worker uploads the columns not yet on the
+/// device or in flight into this cache (retained by the active policy) while kernels of other tasks
+/// run, if free device memory exceeds the copy plus a 2 GiB margin. The scan's own task then hits.
+bool prefetch_enabled() noexcept;
+void prefetch_host_chunk(std::unique_ptr<::cucascade::host_data_representation> next_chunk);
+
 }  // namespace sirius::memory

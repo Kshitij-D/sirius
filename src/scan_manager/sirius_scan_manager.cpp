@@ -325,7 +325,30 @@ struct cached_databatch_provider : public databatch_provider {
       });
       pos = (cursor + _rotate) % n_surv;
     }
+    if (cursor + 1 < n_surv && _entry.tier == cucascade::memory::Tier::HOST &&
+        sirius::memory::prefetch_enabled()) {
+      // Upload-ahead (memory/shared_uploads.hpp): hand the chunk at the next position to the
+      // prefetcher while this one is processed.
+      auto const next = sirius::memory::cooperative_start_enabled() ? (cursor + 1 + _rotate) % n_surv
+                                                                     : cursor + 1;
+      prefetch_chunk(_plan.survivor_chunk_indices[next]);
+    }
     return serve(cursor, pos, n_surv);
+  }
+
+  void prefetch_chunk(std::size_t index)
+  {
+    if (index >= _entry.host_chunks.size() || !_entry.host_chunks.at(index)) { return; }
+    auto* host = dynamic_cast<cucascade::host_data_representation*>(_entry.host_chunks.at(index).get());
+    if (host == nullptr) { return; }  // compressed host chunks decode per scan: not prefetched
+    auto const& ht = host->get_host_table();
+    sirius::memory::note_host_chunk(ht->allocation.get(), &_entry, index);
+    if (sirius::memory::plan_retention_enabled()) {
+      for (std::size_t j = 0; j < _column_indices.size(); ++j) {
+        sirius::memory::note_host_column(ht->allocation.get(), ht->columns.at(_column_indices[j]), _column_names[j]);
+      }
+    }
+    sirius::memory::prefetch_host_chunk(host->slice(_column_indices));
   }
 
   /// Resident-first order (memory/shared_uploads.hpp): among the survivor positions not yet taken, the one whose

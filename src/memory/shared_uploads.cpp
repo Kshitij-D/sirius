@@ -19,6 +19,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <future>
+#include <thread>
+#include <deque>
+#include <condition_variable>
 #include <chrono>
 #include <list>
 #include <map>
@@ -120,6 +123,14 @@ struct cache {
   std::unordered_map<std::uint64_t, active_scan> scans;
   std::uint64_t scan_seq = 0;
   std::atomic<std::uint64_t> nu_evicted{0}, nu_skipped{0};
+  // SIRIUS_SHARE_PREFETCH=1 (B2): next chunks handed over by scans, uploaded by one worker.
+  bool prefetch                                  = false;
+  ::cucascade::memory::memory_space* space        = nullptr;  // device space of the first shared upload
+  std::mutex pf_mu;
+  std::condition_variable pf_cv;
+  std::deque<std::unique_ptr<::cucascade::host_data_representation>> pf_queue;
+  std::once_flag pf_start;
+  std::atomic<std::uint64_t> pf_uploads{0}, pf_bytes{0}, pf_present{0}, pf_skipped{0}, pf_dropped{0};
   std::unordered_map<column_key, std::list<std::pair<column_key, std::shared_ptr<cudf::column>>>::iterator,
                      column_key_hash>
     lru_pos;
@@ -183,6 +194,10 @@ cache& the_cache()
       if (auto const* nm = std::getenv("SIRIUS_SHARE_ELASTIC_NOMARGIN"); nm != nullptr && *nm == '1') { x->margin = 0; }
       std::fprintf(stderr, "[share-upload] elastic retention, cap %zu, margin %zu\n", x->budget, x->margin);
     }
+    if (auto const* pf = std::getenv("SIRIUS_SHARE_PREFETCH"); pf != nullptr && *pf == '1') {
+      x->prefetch = true;
+      std::fprintf(stderr, "[share-upload] prefetch on (next chunk per scan, 2 GiB free-memory margin)\n");
+    }
     if (auto const* t = std::getenv("SIRIUS_SHARE_TRACE"); t != nullptr && *t != '\0') {
       x->trace      = true;
       x->trace_path = t;
@@ -209,6 +224,12 @@ cache& the_cache()
       std::fprintf(stderr, "[share-upload] resident_first picks=%llu resident=%llu true_lru=%d\n",
                    static_cast<unsigned long long>(y.rf_picks.load()),
                    static_cast<unsigned long long>(y.rf_resident.load()), y.true_lru ? 1 : 0);
+      std::fprintf(stderr, "[share-upload] prefetch=%d uploads=%llu bytes=%llu present=%llu skipped=%llu dropped=%llu\n",
+                   y.prefetch ? 1 : 0, static_cast<unsigned long long>(y.pf_uploads.load()),
+                   static_cast<unsigned long long>(y.pf_bytes.load()),
+                   static_cast<unsigned long long>(y.pf_present.load()),
+                   static_cast<unsigned long long>(y.pf_skipped.load()),
+                   static_cast<unsigned long long>(y.pf_dropped.load()));
       std::fprintf(stderr, "[share-upload] nextuse=%d evicted=%llu skipped=%llu\n", y.nextuse ? 1 : 0,
                    static_cast<unsigned long long>(y.nu_evicted.load()),
                    static_cast<unsigned long long>(y.nu_skipped.load()));
@@ -498,6 +519,96 @@ std::shared_ptr<cudf::column> acquire(cache& c,
   return col;
 }
 
+std::size_t host_bytes(const ::cucascade::memory::column_metadata& m)
+{
+  std::size_t b = (m.has_data ? m.data_size : 0) + (m.has_null_mask ? m.null_mask_size : 0);
+  for (auto const& ch : m.children) {
+    b += host_bytes(ch);
+  }
+  return b;
+}
+
+// Upload-ahead of column `i` of `host` (B2): only if it is neither on the device nor in flight and the
+// device has room for it plus a margin; the copy is retained by the active policy (no read counted).
+void prefetch_one(cache& c, ::cucascade::host_data_representation& host, std::size_t i)
+{
+  auto* space = c.space;
+  if (space == nullptr) { return; }
+  auto const& table = host.get_host_table();
+  column_key const key{table->allocation.get(), layout_of(table->columns.at(i))};
+  std::promise<std::shared_ptr<cudf::column>> mine;
+  {
+    std::lock_guard lk(c.mu);
+    auto it = c.entries.find(key);
+    if (it != c.entries.end()) {
+      auto alloc = it->second.allocation.lock();
+      if (alloc && alloc.get() == key.allocation &&
+          (!it->second.column.expired() || it->second.pending.valid())) {
+        c.pf_present.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+    }
+    if (space->get_available_memory() < host_bytes(table->columns.at(i)) + (std::size_t{2} << 30)) {
+      c.pf_skipped.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    auto& e      = c.entries[key];
+    e.allocation = std::shared_ptr<const void>(table->allocation, table->allocation.get());
+    e.column.reset();
+    e.pending = mine.get_future().share();
+  }
+  std::shared_ptr<cudf::column> col;
+  try {
+    col = upload_one(host, i, *space);
+  } catch (...) {
+    {
+      std::lock_guard lk(c.mu);
+      c.entries[key].pending = {};
+    }
+    mine.set_value(nullptr);
+    c.pf_skipped.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  c.pf_uploads.fetch_add(1, std::memory_order_relaxed);
+  c.pf_bytes.fetch_add(col->alloc_size(), std::memory_order_relaxed);
+  c.uploads.fetch_add(1, std::memory_order_relaxed);
+  c.bytes_uploaded.fetch_add(col->alloc_size(), std::memory_order_relaxed);
+  auto const available = c.elastic ? space->get_available_memory() : std::size_t{0};
+  {
+    std::lock_guard lk(c.mu);
+    auto& e   = c.entries[key];
+    e.column  = col;
+    e.pending = {};
+    trace_read(c, key, 'P', col->alloc_size());
+    if (!elastic_admit(c, col->alloc_size(), available)) {
+      // not retained: dropped unless a scan picks it up while the worker still holds it
+    } else if (c.plan_policy) {
+      plan_retain(c, key, col);
+    } else if (c.nextuse) {
+      nextuse_retain(c, key, col);
+    } else {
+      retain(c, key, col);
+    }
+  }
+  mine.set_value(col);
+}
+
+void prefetch_worker(cache& c)
+{
+  for (;;) {
+    std::unique_ptr<::cucascade::host_data_representation> next;
+    {
+      std::unique_lock lk(c.pf_mu);
+      c.pf_cv.wait(lk, [&] { return !c.pf_queue.empty(); });
+      next = std::move(c.pf_queue.front());
+      c.pf_queue.pop_front();
+    }
+    for (std::size_t i = 0; i < next->num_columns(); ++i) {
+      prefetch_one(c, *next, i);
+    }
+  }
+}
+
 }  // namespace
 
 bool shared_uploads_enabled() noexcept
@@ -522,6 +633,10 @@ std::unique_ptr<::cucascade::gpu_table_representation> shared_upload(
   ::cucascade::host_data_representation& host, ::cucascade::memory::memory_space& space)
 {
   auto& c = the_cache();
+  if (c.prefetch && c.space == nullptr) {
+    std::lock_guard lk(c.mu);
+    if (c.space == nullptr) { c.space = &space; }
+  }
   std::vector<std::shared_ptr<cudf::column>> columns;
   std::vector<cudf::column_view> views;
   std::size_t alloc_size = 0;
@@ -542,6 +657,24 @@ bool plan_retention_enabled() noexcept
 }
 
 bool nextuse_enabled() noexcept { return the_cache().nextuse; }
+
+bool prefetch_enabled() noexcept { return the_cache().prefetch; }
+
+void prefetch_host_chunk(std::unique_ptr<::cucascade::host_data_representation> next_chunk)
+{
+  auto& c = the_cache();
+  if (!c.prefetch || !next_chunk) { return; }
+  std::call_once(c.pf_start, [&c] { std::thread([&c] { prefetch_worker(c); }).detach(); });
+  {
+    std::lock_guard lk(c.pf_mu);
+    if (c.pf_queue.size() >= 32) {  // stale look-ahead: the scans have moved on
+      c.pf_queue.pop_front();
+      c.pf_dropped.fetch_add(1, std::memory_order_relaxed);
+    }
+    c.pf_queue.push_back(std::move(next_chunk));
+  }
+  c.pf_cv.notify_one();
+}
 
 std::uint64_t register_scan(const void* entry,
                             std::vector<std::string> const& column_names,
