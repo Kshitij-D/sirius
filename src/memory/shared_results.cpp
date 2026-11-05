@@ -20,6 +20,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -36,6 +37,7 @@ struct registry {
   std::unordered_set<std::uint64_t> allowed;
   std::unordered_map<std::uint64_t, std::shared_ptr<const shared_result>> published;
   std::unordered_set<std::uint64_t> refused;  // over budget: logged once
+  std::unordered_set<std::uint64_t> publishing;  // copy in progress (outside the lock)
   // Batch counts (sirius_share_prepare): planned consumers per key, and consumers whose CTE
   // finished. Counts apply once the prepare pass reports done (counted == true); before that,
   // results publish as without counts and are held.
@@ -280,8 +282,8 @@ void publish_shared_result(std::uint64_t key,
     bytes += ro.get_data()->get_size_in_bytes();
     if (space == nullptr) { space = ro.get_memory_space(); }
   }
-  std::lock_guard lk(r.mu);
-  if (r.published.count(key) != 0) { return; }
+  std::unique_lock lk(r.mu);
+  if (r.published.count(key) != 0 || r.publishing.count(key) != 0) { return; }
   if (r.counted) {
     // Publish only if a consumer that has not finished yet will plan this key (this producer's own
     // finish is counted after publishing).
@@ -300,6 +302,13 @@ void publish_shared_result(std::uint64_t key,
     }
     return;
   }
+  // Reserve the key and its budget, then copy WITHOUT the registry lock: every query's planning takes
+  // it (find_shared_result), and a copy waits behind the GPU's queued work (E88-fix3 s23: GPU busy
+  // fell from 85.6% to 78.9%).
+  r.publishing.insert(key);
+  r.used += bytes;
+  lk.unlock();
+  auto const t0 = std::chrono::steady_clock::now();
   // Copy under the batches' read-only locks (a steal needs mutable access), ordered after each
   // batch's writer, then drop the producer's batches: the registry holds only its own copy.
   auto e = std::make_shared<shared_result>();
@@ -328,17 +337,31 @@ void publish_shared_result(std::uint64_t key,
     e->columns.push_back(std::move(cols));
   }
   cudaStreamSynchronize(s);
+  auto const copy_us =
+    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0)
+      .count();
+  lk.lock();
+  r.publishing.erase(key);
   if (!on_gpu) {
+    r.used -= bytes;
     std::fprintf(stderr, "[share] not on gpu key=%016llx\n", static_cast<unsigned long long>(key));
     return;
   }
   e->logical_types = std::move(logical_types);
   e->bytes         = bytes;
   e->space         = space;
-  r.used += bytes;
   add_resident(space, bytes);  // held until the last expected consumer finishes
-  std::fprintf(stderr, "[share] publish key=%016llx batches=%zu bytes=%zu used=%zu\n",
-               static_cast<unsigned long long>(key), e->columns.size(), bytes, r.used);
+  std::fprintf(stderr, "[share] publish key=%016llx batches=%zu bytes=%zu used=%zu copy_us=%lld\n",
+               static_cast<unsigned long long>(key), e->columns.size(), bytes, r.used,
+               static_cast<long long>(copy_us));
+  if (r.counted && r.served[key] + 1 >= r.expected[key]) {
+    // Every other expected consumer finished while the copy ran (this producer counts after): release.
+    sub_resident(space, bytes);
+    r.used -= bytes;
+    std::fprintf(stderr, "[share] release key=%016llx bytes=%zu served=%zu used=%zu\n",
+                 static_cast<unsigned long long>(key), bytes, r.served[key], r.used);
+    return;
+  }
   r.published.emplace(key, std::move(e));
 }
 
