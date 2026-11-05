@@ -11,6 +11,13 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
+
+#include <cudf/column/column.hpp>
+#include <cudf/utilities/memory_resource.hpp>
+#include <rmm/cuda_stream_view.hpp>
+
+#include <cuda_runtime_api.h>
 
 #include <cctype>
 #include <cstdio>
@@ -293,15 +300,40 @@ void publish_shared_result(std::uint64_t key,
     }
     return;
   }
-  auto e           = std::make_shared<shared_result>();
-  e->batches       = std::move(batches);
+  // Copy under the batches' read-only locks (a steal needs mutable access), ordered after each
+  // batch's writer, then drop the producer's batches: the registry holds only its own copy.
+  auto e = std::make_shared<shared_result>();
+  cudaStream_t s{};
+  cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+  bool on_gpu = true;
+  for (auto const& b : batches) {
+    auto ro        = b->to_read_only();
+    auto const* gr = dynamic_cast<const ::cucascade::gpu_table_representation*>(ro.get_data());
+    if (gr == nullptr) {
+      on_gpu = false;
+      break;
+    }
+    if (auto const ev = gr->get_writer_event(); ev != nullptr) { cudaStreamWaitEvent(s, ev, 0); }
+    std::vector<std::shared_ptr<cudf::column>> cols;
+    for (auto const& c : gr->get_table_view()) {
+      cols.push_back(std::make_shared<cudf::column>(
+        c, rmm::cuda_stream_view{s}, cudf::get_current_device_resource_ref()));
+    }
+    e->columns.push_back(std::move(cols));
+  }
+  cudaStreamSynchronize(s);
+  cudaStreamDestroy(s);
+  if (!on_gpu) {
+    std::fprintf(stderr, "[share] not on gpu key=%016llx\n", static_cast<unsigned long long>(key));
+    return;
+  }
   e->logical_types = std::move(logical_types);
   e->bytes         = bytes;
   e->space         = space;
   r.used += bytes;
   add_resident(space, bytes);  // held until the last expected consumer finishes
   std::fprintf(stderr, "[share] publish key=%016llx batches=%zu bytes=%zu used=%zu\n",
-               static_cast<unsigned long long>(key), e->batches.size(), bytes, r.used);
+               static_cast<unsigned long long>(key), e->columns.size(), bytes, r.used);
   r.published.emplace(key, std::move(e));
 }
 

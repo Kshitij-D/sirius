@@ -33,6 +33,10 @@ class memory_space;
 }
 }  // namespace cucascade
 
+namespace cudf {
+class column;
+}
+
 namespace duckdb {
 class LogicalOperator;
 }
@@ -40,7 +44,11 @@ class LogicalOperator;
 namespace sirius::memory {
 
 struct shared_result {
-  std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
+  /// Registry-owned device copy of the published result, per batch the columns. A replay gets fresh
+  /// batches that only VIEW these columns: neither a consumer nor the producer's own downstream can
+  /// steal, empty or downgrade what other queries replay (E88-fix s21: replaying the producer's batch
+  /// objects gave 0-row results and std::bad_cast).
+  std::vector<std::vector<std::shared_ptr<cudf::column>>> columns;
   duckdb::vector<duckdb::LogicalType> logical_types;
   std::size_t bytes = 0;
   const ::cucascade::memory::memory_space* space = nullptr;
