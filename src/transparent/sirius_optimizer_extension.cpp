@@ -28,8 +28,11 @@
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/config.hpp>
+#include <duckdb/optimizer/column_binding_replacer.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/planner/binder.hpp>
+#include <duckdb/planner/operator/logical_cteref.hpp>
+#include <duckdb/planner/operator/logical_materialized_cte.hpp>
 #include <duckdb/planner/expression/bound_columnref_expression.hpp>
 #include <duckdb/planner/expression/bound_conjunction_expression.hpp>
 #include <duckdb/planner/expression_iterator.hpp>
@@ -39,7 +42,9 @@
 #include <util/duckdb_error_message.hpp>
 
 #include <cstddef>
+#include <cstdio>
 #include <exception>
+#include <functional>
 #include <map>
 #include <unordered_set>
 #include <utility>
@@ -304,6 +309,82 @@ duckdb::unique_ptr<duckdb::LogicalOperator> copy_logical_plan(duckdb::LogicalOpe
   return copy;
 }
 
+// Plan-level subplan sharing (memory/shared_results.hpp). Keys are computed on a binding-resolved copy
+// (positional references, the form create_plan sees, so equal subtrees of different queries get equal
+// keys). The maximal listed subtrees of the captured copy become references to materialized CTEs named
+// __sirius_share_<key> at the plan root; the CTE share path publishes the first finished result and
+// replays it for the later planned consumers of the batch.
+void rewrite_shared_subplans(duckdb::OptimizerExtensionInput& input,
+                             duckdb::LogicalOperator const& captured,
+                             duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
+{
+  auto& context = input.context;
+  auto resolved = copy_logical_plan(captured, context);
+  resolved->ResolveOperatorTypes();
+  duckdb::ColumnBindingResolver resolver;
+  resolver.VisitOperator(*resolved);
+  if (sirius::memory::subplan_dump_enabled()) {
+    std::string sql;
+    try {
+      sql = context.GetCurrentQuery();
+    } catch (std::exception&) {
+      sql.clear();
+    }
+    sirius::memory::dump_subplans(sql, *resolved);
+  }
+  if (!sirius::memory::subplan_sharing_enabled()) { return; }
+
+  // Both copies have the same shape: walk them in lockstep, stop at the first listed subtree per path.
+  std::vector<std::pair<duckdb::unique_ptr<duckdb::LogicalOperator>*, std::uint64_t>> hits;
+  std::function<void(duckdb::unique_ptr<duckdb::LogicalOperator>&, duckdb::LogicalOperator const&, bool)>
+    walk = [&](auto& slot, auto const& res, bool is_root) {
+      if (!is_root && sirius::memory::subplan_shareable(res)) {
+        auto const key = sirius::memory::subplan_share_key(res);
+        if (sirius::memory::share_key_allowed(key)) {
+          hits.emplace_back(&slot, key);
+          return;
+        }
+      }
+      if (slot->children.size() != res.children.size()) { return; }
+      for (std::size_t i = 0; i < res.children.size(); ++i) {
+        walk(slot->children[i], *res.children[i], false);
+      }
+    };
+  walk(plan, *resolved, true);
+  if (hits.empty()) { return; }
+
+  plan->ResolveOperatorTypes();
+  duckdb::ColumnBindingReplacer replacer;
+  for (auto& [slot, key] : hits) {
+    auto& sub         = *slot;
+    auto old_bindings = sub->GetColumnBindings();
+    auto types        = sub->types;
+    if (types.empty() || old_bindings.size() != types.size()) { continue; }
+    char hex[17];
+    std::snprintf(hex, sizeof(hex), "%016llx", static_cast<unsigned long long>(key));
+    std::string const name = std::string(sirius::memory::kSubplanCtePrefix) + hex;
+    duckdb::vector<duckdb::Identifier> names;
+    for (std::size_t i = 0; i < types.size(); ++i) {
+      names.emplace_back(name + "_" + std::to_string(i));
+    }
+    auto const cte_index = input.optimizer.binder.GenerateTableIndex();
+    auto const ref_index = input.optimizer.binder.GenerateTableIndex();
+    auto ref = duckdb::make_uniq<duckdb::LogicalCTERef>(ref_index, cte_index, types, names);
+    if (sub->has_estimated_cardinality) { ref->SetEstimatedCardinality(sub->estimated_cardinality); }
+    replacer.AddReplacements(old_bindings, ref->GetColumnBindings());
+    auto def = std::move(sub);
+    sub      = std::move(ref);
+    plan     = duckdb::make_uniq<duckdb::LogicalMaterializedCTE>(duckdb::Identifier(name),
+                                                             cte_index,
+                                                             types.size(),
+                                                             std::move(def),
+                                                             std::move(plan),
+                                                             duckdb::CTEMaterialize::CTE_MATERIALIZE_ALWAYS);
+  }
+  replacer.VisitOperator(*plan);
+  plan->ResolveOperatorTypes();
+}
+
 void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
                            duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
 {
@@ -336,7 +417,11 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
     }
     conn_state->set_captured_original_views(
       sirius::op::scan::capture_bound_read_views(*captured, context));
-    conn_state->set_captured_plan(copy_logical_plan(*captured, context));
+    auto captured_copy = copy_logical_plan(*captured, context);
+    if (sirius::memory::subplan_sharing_enabled() || sirius::memory::subplan_dump_enabled()) {
+      rewrite_shared_subplans(input, *captured, captured_copy);
+    }
+    conn_state->set_captured_plan(std::move(captured_copy));
     if (auto const* sql = sirius::memory::counting_sql()) {  // sirius_share_prepare pass
       // Same steps create_plan applies to the captured copy before planning (types, then column
       // bindings), so the counted signatures equal the ones seen at execution.

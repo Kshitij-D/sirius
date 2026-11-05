@@ -34,6 +34,7 @@ struct registry {
   std::size_t used = 0;
   std::size_t budget = std::size_t{4} << 30;
   bool on = false;
+  bool subplans_on = false;
 };
 
 void load(registry& x)
@@ -56,11 +57,41 @@ void load(registry& x)
   std::fprintf(stderr, "[share] on: %zu keys, budget %zu bytes\n", x.allowed.size(), x.budget);
 }
 
+// Subplan keys come with their planned consumer counts, so counts apply from the start (no prepare pass).
+void load_subplans(registry& x)
+{
+  auto const* path = std::getenv("SIRIUS_SHARE_SUBPLANS");
+  if (path == nullptr || *path == '\0') { return; }
+  std::ifstream in(path);
+  if (!in) {
+    std::fprintf(stderr, "[share] cannot read SIRIUS_SHARE_SUBPLANS=%s; subplan sharing off\n", path);
+    return;
+  }
+  std::string hex;
+  std::size_t count = 0, n = 0;
+  while (in >> hex >> count) {
+    auto const key = std::stoull(hex, nullptr, 16);
+    x.allowed.insert(key);
+    x.expected[key] = count;
+    ++n;
+  }
+  if (auto const* b = std::getenv("SIRIUS_SHARE_BUDGET_BYTES"); b != nullptr && *b != '\0') {
+    x.budget = std::stoull(b);
+  }
+  x.counted     = true;
+  x.on          = true;
+  x.subplans_on = true;
+  std::fprintf(stderr, "[share] subplans on: %zu keys, budget %zu bytes\n", n, x.budget);
+}
+
 registry& reg()
 {
   static registry r;
   static std::once_flag once;
-  std::call_once(once, [] { load(r); });
+  std::call_once(once, [] {
+    load(r);
+    load_subplans(r);
+  });
   return r;
 }
 
@@ -362,6 +393,87 @@ void note_shared_hit(std::uint64_t key, std::size_t bytes)
 {
   std::fprintf(stderr, "[share] hit key=%016llx bytes=%zu\n", static_cast<unsigned long long>(key),
                bytes);
+}
+
+bool subplan_sharing_enabled() noexcept { return reg().subplans_on; }
+
+std::uint64_t subplan_share_key(duckdb::LogicalOperator const& resolved_op)
+{
+  return fnv1a("subplan|" + optimized_plan_signature(resolved_op));
+}
+
+bool subplan_shareable(duckdb::LogicalOperator const& op)
+{
+  using T = duckdb::LogicalOperatorType;
+  switch (op.type) {
+    case T::LOGICAL_CTE_REF:
+    case T::LOGICAL_MATERIALIZED_CTE:
+    case T::LOGICAL_RECURSIVE_CTE:
+    case T::LOGICAL_DELIM_GET:
+    case T::LOGICAL_DELIM_JOIN:
+    case T::LOGICAL_DEPENDENT_JOIN:
+    case T::LOGICAL_EXPLAIN:
+    case T::LOGICAL_PREPARE:
+    case T::LOGICAL_EXECUTE:
+    case T::LOGICAL_INSERT:
+    case T::LOGICAL_UPDATE:
+    case T::LOGICAL_DELETE: return false;
+    default: break;
+  }
+  for (auto const& child : op.children) {
+    if (!subplan_shareable(*child)) { return false; }
+  }
+  return true;
+}
+
+namespace {
+std::FILE* dump_file()
+{
+  static std::FILE* f = [] {
+    auto const* path = std::getenv("SIRIUS_SHARE_SUBPLAN_DUMP");
+    return (path == nullptr || *path == '\0') ? nullptr : std::fopen(path, "a");
+  }();
+  return f;
+}
+
+std::size_t estimated_row_bytes(duckdb::LogicalOperator const& op)
+{
+  std::size_t w = 0;
+  for (auto const& t : op.types) {
+    auto const p = t.InternalType();
+    w += p == duckdb::PhysicalType::VARCHAR ? 24 : duckdb::GetTypeIdSize(p);
+  }
+  return w;
+}
+
+std::size_t dump_node(std::FILE* f, duckdb::LogicalOperator const& op, long parent, std::size_t& next_id)
+{
+  auto const id   = next_id++;
+  auto const rows = op.has_estimated_cardinality ? op.estimated_cardinality : 0;
+  std::fprintf(f, "N %zu %ld %016llx %s %llu %llu %c\n", id, parent,
+               static_cast<unsigned long long>(subplan_share_key(op)),
+               duckdb::LogicalOperatorToString(op.type).c_str(), static_cast<unsigned long long>(rows),
+               static_cast<unsigned long long>(rows * estimated_row_bytes(op)),
+               subplan_shareable(op) ? 'e' : 'x');
+  for (auto const& child : op.children) {
+    dump_node(f, *child, static_cast<long>(id), next_id);
+  }
+  return id;
+}
+}  // namespace
+
+bool subplan_dump_enabled() noexcept { return dump_file() != nullptr; }
+
+void dump_subplans(const std::string& sql, duckdb::LogicalOperator const& resolved_plan)
+{
+  auto* f = dump_file();
+  if (f == nullptr) { return; }
+  static std::mutex mu;
+  std::lock_guard lk(mu);
+  std::fprintf(f, "S %016llx\n", static_cast<unsigned long long>(fnv1a(sql)));
+  std::size_t next_id = 0;
+  dump_node(f, resolved_plan, -1, next_id);
+  std::fflush(f);
 }
 
 }  // namespace sirius::memory

@@ -46,7 +46,18 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalMaterializedCTE& op)
   // already published for this CTE body, or mark this CTE to publish its own.
   std::uint64_t share_key = 0;
   std::shared_ptr<const sirius::memory::shared_result> shared;
-  if (sirius::memory::sharing_enabled()) {
+  auto const& cte_name = op.ctename.GetIdentifierName();
+  std::string const subplan_prefix(sirius::memory::kSubplanCtePrefix);
+  if (sirius::memory::sharing_enabled() && cte_name.rfind(subplan_prefix, 0) == 0) {
+    // A subplan the optimizer hook materialized: the key is in the name (computed on the resolved
+    // subtree, so it already covers the optimized body).
+    auto const key = std::stoull(cte_name.substr(subplan_prefix.size()), nullptr, 16);
+    if (sirius::memory::share_key_allowed(key)) {
+      share_key = key;
+      shared    = sirius::memory::find_shared_result(share_key);
+      if (shared && shared->logical_types != op.children[0]->types) { shared = nullptr; }
+    }
+  } else if (sirius::memory::sharing_enabled()) {
     std::string sql;
     try {
       sql = context.GetCurrentQuery();

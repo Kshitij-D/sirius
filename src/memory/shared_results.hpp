@@ -93,4 +93,20 @@ void note_shared_cte_finished(std::uint64_t key);
 /// Count a consumer that replayed `key` (log only).
 void note_shared_hit(std::uint64_t key, std::size_t bytes);
 
+/// Plan-level subplan sharing (SIRIUS_SHARE_SUBPLANS=<file of "hexkey count" lines from the offline batch
+/// planner>): an optimized subtree whose key is listed is materialized as a CTE named
+/// "__sirius_share_<hexkey>" in the captured plan, so the CTE share path publishes or replays it.
+/// Counts are the planned consumers per key (publish only for a later one, release after the last).
+bool subplan_sharing_enabled() noexcept;
+/// Key of an optimized, binding-resolved subtree (query-independent: positional references).
+std::uint64_t subplan_share_key(duckdb::LogicalOperator const& resolved_op);
+/// True if no operator of the subtree is a CTE, CTE reference, delim/dependent join or DML.
+bool subplan_shareable(duckdb::LogicalOperator const& op);
+/// Prefix of the CTE names the subplan rewrite creates.
+inline constexpr const char* kSubplanCtePrefix = "__sirius_share_";
+/// SIRIUS_SHARE_SUBPLAN_DUMP=<path>: append every subtree of each captured plan (preorder, with parent,
+/// key, operator, estimated rows and bytes) for the offline batch planner.
+bool subplan_dump_enabled() noexcept;
+void dump_subplans(const std::string& sql, duckdb::LogicalOperator const& resolved_plan);
+
 }  // namespace sirius::memory
