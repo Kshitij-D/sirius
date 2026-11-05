@@ -355,6 +355,13 @@ void rewrite_shared_subplans(duckdb::OptimizerExtensionInput& input,
 
   plan->ResolveOperatorTypes();
   duckdb::ColumnBindingReplacer replacer;
+  struct cte_definition {
+    std::string name;
+    duckdb::TableIndex index;
+    std::size_t width;
+    duckdb::unique_ptr<duckdb::LogicalOperator> body;
+  };
+  std::vector<cte_definition> definitions;
   for (auto& [slot, key] : hits) {
     auto& sub         = *slot;
     auto old_bindings = sub->GetColumnBindings();
@@ -372,16 +379,21 @@ void rewrite_shared_subplans(duckdb::OptimizerExtensionInput& input,
     auto ref = duckdb::make_uniq<duckdb::LogicalCTERef>(ref_index, cte_index, types, names);
     if (sub->has_estimated_cardinality) { ref->SetEstimatedCardinality(sub->estimated_cardinality); }
     replacer.AddReplacements(old_bindings, ref->GetColumnBindings());
-    auto def = std::move(sub);
-    sub      = std::move(ref);
-    plan     = duckdb::make_uniq<duckdb::LogicalMaterializedCTE>(duckdb::Identifier(name),
-                                                             cte_index,
-                                                             types.size(),
-                                                             std::move(def),
+    definitions.push_back({name, cte_index, types.size(), std::move(sub)});
+    sub = std::move(ref);
+  }
+  // Rebind the consumers only. A definition keeps the bindings its own operators produce: a join or
+  // filter at its root references exactly the bindings being replaced (E88 s20: rebinding the
+  // definitions broke them, 'Failed to bind column reference').
+  replacer.VisitOperator(*plan);
+  for (auto& d : definitions) {
+    plan = duckdb::make_uniq<duckdb::LogicalMaterializedCTE>(duckdb::Identifier(d.name),
+                                                             d.index,
+                                                             d.width,
+                                                             std::move(d.body),
                                                              std::move(plan),
                                                              duckdb::CTEMaterialize::CTE_MATERIALIZE_ALWAYS);
   }
-  replacer.VisitOperator(*plan);
   plan->ResolveOperatorTypes();
 }
 

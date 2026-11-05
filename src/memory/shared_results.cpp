@@ -5,6 +5,10 @@
 #include "duckdb/common/enums/logical_operator_type.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 
@@ -397,28 +401,124 @@ void note_shared_hit(std::uint64_t key, std::size_t bytes)
 
 bool subplan_sharing_enabled() noexcept { return reg().subplans_on; }
 
+namespace {
+template <class Indexes>
+void append_indexes(std::string& out, char const* label, Indexes const& indexes)
+{
+  out += label;
+  out += "=[";
+  for (auto const& i : indexes) {
+    out += std::to_string(static_cast<duckdb::idx_t>(i)) + ",";
+  }
+  out += "];";
+}
+
+void append_column_index(std::string& out, duckdb::ColumnIndex const& c)
+{
+  out += std::to_string(c.GetPrimaryIndex());
+  if (!c.GetChildIndexes().empty()) {
+    out += "{";
+    for (auto const& child : c.GetChildIndexes()) {
+      append_column_index(out, child);
+      out += ",";
+    }
+    out += "}";
+  }
+}
+
+// What ParamsToString leaves out but the result depends on (E88 s20: q42 and q52 got each other's
+// results; their item scans differ only in the columns they read). Called for the operator types
+// subplan_shareable admits.
+void append_identity(std::string& out, duckdb::LogicalOperator const& op)
+{
+  using T = duckdb::LogicalOperatorType;
+  switch (op.type) {
+    case T::LOGICAL_GET: {
+      auto const& get = op.Cast<duckdb::LogicalGet>();
+      out += "fn=" + (get.function.GetDefinition() ? get.function.GetDefinition()->name.GetIdentifierName() : std::string("?")) + ";name=" + get.GetName() + ";params=";
+      for (auto const& v : get.parameters) {
+        out += v.ToString() + ",";
+      }
+      out += ";named=";
+      for (auto const& kv : get.named_parameters) {
+        out += kv.first.GetIdentifierName() + ":" + kv.second.ToString() + ",";
+      }
+      out += ";cols=";
+      for (auto const& c : get.GetColumnIds()) {
+        auto const primary = c.GetPrimaryIndex();
+        out += (!c.IsVirtualColumn() && primary < get.names.size())
+                 ? get.names[primary].GetIdentifierName()
+                 : std::string("virtual");
+        out += "#";
+        append_column_index(out, c);
+        out += ",";
+      }
+      out += ";";
+      append_indexes(out, "proj", get.projection_ids);
+      break;
+    }
+    case T::LOGICAL_FILTER:
+      append_indexes(out, "proj", op.Cast<duckdb::LogicalFilter>().projection_map);
+      break;
+    case T::LOGICAL_COMPARISON_JOIN: {
+      auto const& join = op.Cast<duckdb::LogicalComparisonJoin>();
+      append_indexes(out, "lproj", join.left_projection_map);
+      append_indexes(out, "rproj", join.right_projection_map);
+      break;
+    }
+    case T::LOGICAL_AGGREGATE_AND_GROUP_BY: {
+      auto const& agg = op.Cast<duckdb::LogicalAggregate>();
+      out += "sets=";
+      for (auto const& set : agg.grouping_sets) {
+        append_indexes(out, "", set);
+      }
+      out += "functions=";
+      for (auto const& f : agg.grouping_functions) {
+        append_indexes(out, "", f);
+      }
+      out += ";";
+      break;
+    }
+    default: break;
+  }
+}
+
+std::string subplan_signature(duckdb::LogicalOperator const& op)
+{
+  std::string out = duckdb::LogicalOperatorToString(op.type) + "{";
+  for (auto const& kv : op.ParamsToString()) {
+    out += kv.first + "=" + kv.second + ";";
+  }
+  append_identity(out, op);
+  out += "types=";
+  for (auto const& t : op.types) {
+    out += t.ToString() + ",";
+  }
+  out += "}(";
+  for (auto const& child : op.children) {
+    out += subplan_signature(*child) + ",";
+  }
+  return out + ")";
+}
+}  // namespace
+
 std::uint64_t subplan_share_key(duckdb::LogicalOperator const& resolved_op)
 {
-  return fnv1a("subplan|" + optimized_plan_signature(resolved_op));
+  return fnv1a("subplan2|" + subplan_signature(resolved_op));
 }
 
 bool subplan_shareable(duckdb::LogicalOperator const& op)
 {
+  // Only operators whose whole result identity subplan_signature covers (append_identity).
   using T = duckdb::LogicalOperatorType;
   switch (op.type) {
-    case T::LOGICAL_CTE_REF:
-    case T::LOGICAL_MATERIALIZED_CTE:
-    case T::LOGICAL_RECURSIVE_CTE:
-    case T::LOGICAL_DELIM_GET:
-    case T::LOGICAL_DELIM_JOIN:
-    case T::LOGICAL_DEPENDENT_JOIN:
-    case T::LOGICAL_EXPLAIN:
-    case T::LOGICAL_PREPARE:
-    case T::LOGICAL_EXECUTE:
-    case T::LOGICAL_INSERT:
-    case T::LOGICAL_UPDATE:
-    case T::LOGICAL_DELETE: return false;
-    default: break;
+    case T::LOGICAL_GET:
+    case T::LOGICAL_FILTER:
+    case T::LOGICAL_PROJECTION:
+    case T::LOGICAL_COMPARISON_JOIN:
+    case T::LOGICAL_CROSS_PRODUCT:
+    case T::LOGICAL_AGGREGATE_AND_GROUP_BY: break;
+    default: return false;
   }
   for (auto const& child : op.children) {
     if (!subplan_shareable(*child)) { return false; }
