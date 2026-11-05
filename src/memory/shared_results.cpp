@@ -303,8 +303,14 @@ void publish_shared_result(std::uint64_t key,
   // Copy under the batches' read-only locks (a steal needs mutable access), ordered after each
   // batch's writer, then drop the producer's batches: the registry holds only its own copy.
   auto e = std::make_shared<shared_result>();
-  cudaStream_t s{};
-  cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+  // One long-lived stream: the copies' device buffers are freed on their allocation stream when the
+  // last replay drops them (E88-fix2 s22: a per-publish stream destroyed after the copy segfaulted
+  // in cuMemFreeAsync).
+  static cudaStream_t const s = [] {
+    cudaStream_t created{};
+    cudaStreamCreateWithFlags(&created, cudaStreamNonBlocking);
+    return created;
+  }();
   bool on_gpu = true;
   for (auto const& b : batches) {
     auto ro        = b->to_read_only();
@@ -322,7 +328,6 @@ void publish_shared_result(std::uint64_t key,
     e->columns.push_back(std::move(cols));
   }
   cudaStreamSynchronize(s);
-  cudaStreamDestroy(s);
   if (!on_gpu) {
     std::fprintf(stderr, "[share] not on gpu key=%016llx\n", static_cast<unsigned long long>(key));
     return;
