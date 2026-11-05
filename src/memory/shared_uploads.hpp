@@ -17,6 +17,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <atomic>
 #include <optional>
 #include <string>
 #include <vector>
@@ -76,5 +77,22 @@ std::size_t retained_bytes() noexcept;
 
 /// Count one resident-first pick (`resident` = the chosen chunk had retained bytes).
 void note_resident_first_pick(bool resident) noexcept;
+
+/// Next-use retention (SIRIUS_SHARE_UPLOAD_POLICY=nextuse, ROADMAP B1b): the retained copy whose next
+/// read is farthest away is evicted first (Belady with predicted reads), and a new copy that would be
+/// the farthest is not retained. A copy's next read is the fewest chunks any host-tier scan in flight
+/// still has to take before it reaches that chunk (PBM-like); a copy no scan in flight still needs
+/// comes last, least recently used first.
+bool nextuse_enabled() noexcept;
+
+/// A host-tier scan in flight on `entry`: the columns it reads, its chunk order (survivor chunk
+/// indices, served from position `*rotate` on) and its cursor (positions handed out). Unregister
+/// before `cursor` and `rotate` die. Returns 0 when next-use retention is off.
+std::uint64_t register_scan(const void* entry,
+                            std::vector<std::string> const& column_names,
+                            std::vector<std::size_t> const& survivor_chunks,
+                            const std::atomic<std::size_t>* cursor,
+                            const std::size_t* rotate);
+void unregister_scan(std::uint64_t id);
 
 }  // namespace sirius::memory

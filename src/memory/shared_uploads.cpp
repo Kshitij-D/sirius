@@ -9,7 +9,9 @@
 
 #include <cudf/table/table.hpp>
 
+#include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <fstream>
 #include <set>
 #include <string>
@@ -22,6 +24,7 @@
 #include <map>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace sirius::memory {
@@ -104,6 +107,19 @@ struct cache {
   std::list<std::pair<column_key, std::shared_ptr<cudf::column>>> lru;  // retained copies
   // SIRIUS_SHARE_UPLOAD_POLICY=lru: a hit moves the copy to the back (true LRU). Default: insertion order (FIFO).
   bool true_lru = false;
+  // SIRIUS_SHARE_UPLOAD_POLICY=nextuse (B1b): host-tier scans in flight, for the next read of a copy.
+  bool nextuse = false;
+  struct active_scan {
+    const void* entry;
+    std::unordered_set<std::string> names;
+    std::unordered_map<std::size_t, std::size_t> position;  // chunk index -> position in the scan order
+    std::size_t n;
+    const std::atomic<std::size_t>* cursor;
+    const std::size_t* rotate;
+  };
+  std::unordered_map<std::uint64_t, active_scan> scans;
+  std::uint64_t scan_seq = 0;
+  std::atomic<std::uint64_t> nu_evicted{0}, nu_skipped{0};
   std::unordered_map<column_key, std::list<std::pair<column_key, std::shared_ptr<cudf::column>>>::iterator,
                      column_key_hash>
     lru_pos;
@@ -152,6 +168,11 @@ cache& the_cache()
       std::fprintf(stderr, "[share-upload] plan policy: %zu columns with reader counts, budget %zu\n",
                    x->expected_readers.size(), x->budget);
     }
+    if (auto const* pol = std::getenv("SIRIUS_SHARE_UPLOAD_POLICY"); pol != nullptr && std::string(pol) == "nextuse") {
+      x->nextuse  = true;
+      x->true_lru = true;  // the retained list keeps recency order for ties
+      std::fprintf(stderr, "[share-upload] next-use policy, budget %zu\n", x->budget);
+    }
     if (auto const* pol = std::getenv("SIRIUS_SHARE_UPLOAD_POLICY"); pol != nullptr && std::string(pol) == "lru") {
       x->true_lru = true;
       std::fprintf(stderr, "[share-upload] true LRU policy, budget %zu\n", x->budget);
@@ -188,6 +209,9 @@ cache& the_cache()
       std::fprintf(stderr, "[share-upload] resident_first picks=%llu resident=%llu true_lru=%d\n",
                    static_cast<unsigned long long>(y.rf_picks.load()),
                    static_cast<unsigned long long>(y.rf_resident.load()), y.true_lru ? 1 : 0);
+      std::fprintf(stderr, "[share-upload] nextuse=%d evicted=%llu skipped=%llu\n", y.nextuse ? 1 : 0,
+                   static_cast<unsigned long long>(y.nu_evicted.load()),
+                   static_cast<unsigned long long>(y.nu_skipped.load()));
       if (y.trace) {
         std::lock_guard lk(y.mu);
         if (std::FILE* f = std::fopen(y.trace_path.c_str(), "w")) {
@@ -265,6 +289,61 @@ void retain(cache& c, const column_key& key, const std::shared_ptr<cudf::column>
     c.lru_pos.erase(front.first);
     c.lru.pop_front();
   }
+}
+
+// Chunks the nearest scan in flight still takes before it reads `key`'s chunk; SIZE_MAX if none will.
+std::size_t next_use(cache const& c, const column_key& key)
+{
+  auto const pl = c.chunk_of.find(key.allocation);
+  auto const nm = c.name_of.find(key);
+  if (pl == c.chunk_of.end() || nm == c.name_of.end()) { return SIZE_MAX; }
+  std::size_t best = SIZE_MAX;
+  for (auto const& [id, sc] : c.scans) {
+    if (sc.entry != pl->second.entry || sc.n == 0 || sc.names.count(nm->second) == 0) { continue; }
+    auto const pos = sc.position.find(pl->second.index);
+    if (pos == sc.position.end()) { continue; }
+    auto const step = (pos->second + sc.n - *sc.rotate % sc.n) % sc.n;  // when this scan takes it
+    auto const cur  = sc.cursor->load(std::memory_order_relaxed);
+    if (step >= cur) { best = std::min(best, step - cur); }
+  }
+  return best;
+}
+
+void drop_lru(cache& c, std::list<std::pair<column_key, std::shared_ptr<cudf::column>>>::iterator it)
+{
+  c.retained_bytes -= it->second->alloc_size();
+  chunk_adjust(c, it->first.allocation, it->second->alloc_size(), false);
+  c.lru_pos.erase(it->first);
+  c.lru.erase(it);
+}
+
+// Next-use retention (B1b): evict the copy read farthest in the future; do not retain a new copy that
+// would itself be the farthest.
+void nextuse_retain(cache& c, const column_key& key, const std::shared_ptr<cudf::column>& col)
+{
+  auto const bytes = col->alloc_size();
+  if (c.budget == 0 || bytes > c.budget || c.lru_pos.count(key) != 0) { return; }
+  auto const mine = next_use(c, key);
+  while (c.retained_bytes + bytes > c.budget && !c.lru.empty()) {
+    auto victim     = c.lru.begin();
+    std::size_t far = next_use(c, victim->first);
+    for (auto it = std::next(c.lru.begin()); it != c.lru.end(); ++it) {  // oldest first wins ties
+      if (auto const d = next_use(c, it->first); d > far) {
+        victim = it;
+        far    = d;
+      }
+    }
+    if (far < mine) {
+      c.nu_skipped.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    drop_lru(c, victim);
+    c.nu_evicted.fetch_add(1, std::memory_order_relaxed);
+  }
+  c.lru.emplace_back(key, col);
+  c.lru_pos[key] = std::prev(c.lru.end());
+  c.retained_bytes += bytes;
+  chunk_adjust(c, key.allocation, bytes, true);
 }
 
 void plan_drop(cache& c, std::unordered_map<column_key, planned_slot, column_key_hash>::iterator it)
@@ -409,6 +488,8 @@ std::shared_ptr<cudf::column> acquire(cache& c,
       // not retained: the copy lives while its scans hold it
     } else if (c.plan_policy) {
       plan_retain(c, key, col);
+    } else if (c.nextuse) {
+      nextuse_retain(c, key, col);
     } else {
       retain(c, key, col);
     }
@@ -454,7 +535,37 @@ std::unique_ptr<::cucascade::gpu_table_representation> shared_upload(
     view, std::move(columns), alloc_size, space, ::cuda::stream_ref{cudaStream_t{}});
 }
 
-bool plan_retention_enabled() noexcept { return the_cache().plan_policy; }
+bool plan_retention_enabled() noexcept
+{
+  auto const& c = the_cache();
+  return c.plan_policy || c.nextuse;  // both need the column names of host chunks
+}
+
+bool nextuse_enabled() noexcept { return the_cache().nextuse; }
+
+std::uint64_t register_scan(const void* entry,
+                            std::vector<std::string> const& column_names,
+                            std::vector<std::size_t> const& survivor_chunks,
+                            const std::atomic<std::size_t>* cursor,
+                            const std::size_t* rotate)
+{
+  auto& c = the_cache();
+  if (!c.nextuse) { return 0; }
+  cache::active_scan sc{entry, {column_names.begin(), column_names.end()}, {}, survivor_chunks.size(), cursor, rotate};
+  for (std::size_t i = 0; i < survivor_chunks.size(); ++i) { sc.position.emplace(survivor_chunks[i], i); }
+  std::lock_guard lk(c.mu);
+  auto const id = ++c.scan_seq;
+  c.scans.emplace(id, std::move(sc));
+  return id;
+}
+
+void unregister_scan(std::uint64_t id)
+{
+  if (id == 0) { return; }
+  auto& c = the_cache();
+  std::lock_guard lk(c.mu);
+  c.scans.erase(id);
+}
 
 void note_host_column(const void* allocation,
                       const ::cucascade::memory::column_metadata& column,
@@ -510,7 +621,19 @@ std::size_t reclaim_retained(std::size_t bytes)
   c.last_pressure = std::chrono::steady_clock::now();
   c.reclaim_events.fetch_add(1, std::memory_order_relaxed);
   std::size_t freed = 0;
-  if (c.plan_policy) {
+  if (c.nextuse) {
+    // Farthest next read first (ties: least recently used first).
+    std::vector<std::pair<std::size_t, std::list<std::pair<column_key, std::shared_ptr<cudf::column>>>::iterator>> order;
+    std::size_t rank = 0;
+    for (auto it = c.lru.begin(); it != c.lru.end(); ++it, ++rank) { order.emplace_back(next_use(c, it->first), it); }
+    std::stable_sort(order.begin(), order.end(), [](auto const& a, auto const& b) { return a.first > b.first; });
+    for (auto& [d, it] : order) {
+      if (freed >= bytes) { break; }
+      if (it->second.use_count() > 1) { continue; }  // a scan holds it
+      freed += it->second->alloc_size();
+      drop_lru(c, it);
+    }
+  } else if (c.plan_policy) {
     for (auto it = c.plan_index.begin(); it != c.plan_index.end() && freed < bytes;) {
       auto slot = c.planned.find(column_key{std::get<2>(*it), std::get<3>(*it)});
       ++it;

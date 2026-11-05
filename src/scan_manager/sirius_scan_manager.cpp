@@ -224,7 +224,14 @@ struct cached_databatch_provider : public databatch_provider {
       _column_indices.push_back(idx);
     });
     prepare_origin_annotation();
+    if (_entry.tier == cucascade::memory::Tier::HOST && sirius::memory::nextuse_enabled()) {
+      // Next-use retention (memory/shared_uploads.hpp): the cache reads this scan's progress.
+      _nextuse_scan = sirius::memory::register_scan(
+        &_entry, _column_names, _plan.survivor_chunk_indices, &_index, &_rotate);
+    }
   }
+
+  ~cached_databatch_provider() override { sirius::memory::unregister_scan(_nextuse_scan); }
 
   /// Precompute what every served batch's origin annotation shares: the column
   /// origins, and where each chunk starts in pin order.
@@ -688,6 +695,7 @@ struct cached_databatch_provider : public databatch_provider {
   //! Cooperative start offset into the survivor positions (host tier, shared uploads only).
   std::once_flag _rotate_once;
   std::size_t _rotate{0};
+  std::uint64_t _nextuse_scan{0};
   //! Resident-first order state (SIRIUS_SHARE_RESIDENT_FIRST=1).
   std::mutex _rf_mu;
   std::vector<bool> _rf_taken;
