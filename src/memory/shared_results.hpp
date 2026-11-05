@@ -20,6 +20,8 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/vector.hpp"
 
+#include <cuda_runtime_api.h>
+
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -49,6 +51,8 @@ struct shared_result {
   /// steal, empty or downgrade what other queries replay (E88-fix s21: replaying the producer's batch
   /// objects gave 0-row results and std::bad_cast).
   std::vector<std::vector<std::shared_ptr<cudf::column>>> columns;
+  /// Stream the registry's views are ordered on (it waited on the producer's writer events).
+  cudaStream_t writer = nullptr;
   duckdb::vector<duckdb::LogicalType> logical_types;
   std::size_t bytes = 0;
   const ::cucascade::memory::memory_space* space = nullptr;
