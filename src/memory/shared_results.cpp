@@ -309,13 +309,12 @@ void publish_shared_result(std::uint64_t key,
   r.used += bytes;
   lk.unlock();
   auto const t0 = std::chrono::steady_clock::now();
-  // Share the producer's columns without copying (as shared uploads do): move each batch's table
-  // into shared columns, give the producer's batch back a view-backed representation of them (a
-  // view cannot be stolen; a downgrade copies it out), and keep the same columns in the registry.
-  // The publish stream waits on each batch's writer event and is the writer of the new views, so
-  // readers stay ordered after the producer's writes without a host sync (E88-fix4 s24 copied and
-  // synced on a GPU executor worker).
+  // Copy under the batches' read-only locks (a steal needs mutable access), ordered after each
+  // batch's writer, then drop the producer's batches: the registry holds only its own copy.
   auto e = std::make_shared<shared_result>();
+  // One long-lived stream: the copies' device buffers are freed on their allocation stream when the
+  // last replay drops them (E88-fix2 s22: a per-publish stream destroyed after the copy segfaulted
+  // in cuMemFreeAsync).
   static cudaStream_t const s = [] {
     cudaStream_t created{};
     cudaStreamCreateWithFlags(&created, cudaStreamNonBlocking);
@@ -323,32 +322,21 @@ void publish_shared_result(std::uint64_t key,
   }();
   bool on_gpu = true;
   for (auto const& b : batches) {
-    auto mut = b->to_mutable();
-    auto* gr = dynamic_cast<::cucascade::gpu_table_representation*>(mut.get_data());
+    auto ro        = b->to_read_only();
+    auto const* gr = dynamic_cast<const ::cucascade::gpu_table_representation*>(ro.get_data());
     if (gr == nullptr) {
       on_gpu = false;
       break;
     }
     if (auto const ev = gr->get_writer_event(); ev != nullptr) { cudaStreamWaitEvent(s, ev, 0); }
-    auto& batch_space = gr->get_memory_space();
-    auto owned        = gr->release_table(::cuda::stream_ref{s})->release();
     std::vector<std::shared_ptr<cudf::column>> cols;
-    std::vector<cudf::column_view> views;
-    std::size_t alloc_size = 0;
-    for (auto& c : owned) {
-      cols.push_back(std::shared_ptr<cudf::column>(std::move(c)));
-      views.push_back(cols.back()->view());
-      alloc_size += cols.back()->alloc_size();
+    for (auto const& c : gr->get_table_view()) {
+      cols.push_back(std::make_shared<cudf::column>(
+        c, rmm::cuda_stream_view{s}, cudf::get_current_device_resource_ref()));
     }
-    mut.set_data(std::make_unique<::cucascade::gpu_table_representation>(
-      cudf::table_view(views),
-      std::vector<std::shared_ptr<cudf::column>>(cols),
-      alloc_size,
-      batch_space,
-      ::cuda::stream_ref{s}));
     e->columns.push_back(std::move(cols));
   }
-  e->writer = s;
+  cudaStreamSynchronize(s);
   auto const copy_us =
     std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0)
       .count();
@@ -363,7 +351,7 @@ void publish_shared_result(std::uint64_t key,
   e->bytes         = bytes;
   e->space         = space;
   add_resident(space, bytes);  // held until the last expected consumer finishes
-  std::fprintf(stderr, "[share] publish key=%016llx batches=%zu bytes=%zu used=%zu share_us=%lld\n",
+  std::fprintf(stderr, "[share] publish key=%016llx batches=%zu bytes=%zu used=%zu copy_us=%lld\n",
                static_cast<unsigned long long>(key), e->columns.size(), bytes, r.used,
                static_cast<long long>(copy_us));
   if (r.counted && r.served[key] + 1 >= r.expected[key]) {

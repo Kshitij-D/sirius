@@ -66,8 +66,7 @@ std::unique_ptr<operator_data> sirius_physical_shared_result_scan::execute(
   nvtx_scoped_range nvtx_range{"sirius_physical_shared_result_scan::execute"};
   memory::note_shared_hit(_key, _result->bytes);
   // Fresh batches over views of the registry's columns (memory/shared_results.hpp): the shared
-  // columns stay alive through the views' owners and are never stolen or moved by this query. The
-  // views are written on the registry's stream, so this query's readers wait on its event.
+  // columns stay alive through the views' owners and are never stolen or moved by this query.
   std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
   auto* space = const_cast<::cucascade::memory::memory_space*>(_result->space);
   for (auto const& cols : _result->columns) {
@@ -82,7 +81,7 @@ std::unique_ptr<operator_data> sirius_physical_shared_result_scan::execute(
       std::vector<std::shared_ptr<cudf::column>>(cols),
       alloc_size,
       *space,
-      ::cuda::stream_ref{_result->writer});
+      ::cuda::stream_ref{cudaStream_t{}});
     batches.push_back(::cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(rep)));
   }
   return std::make_unique<pipelineable_operator_data>(std::move(batches));
