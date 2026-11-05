@@ -38,6 +38,7 @@ struct registry {
   std::unordered_map<std::uint64_t, std::shared_ptr<const shared_result>> published;
   std::unordered_set<std::uint64_t> refused;  // over budget: logged once
   std::unordered_set<std::uint64_t> publishing;  // copy in progress (outside the lock)
+  std::unordered_set<std::uint64_t> producing;   // a planned producer claimed the key (E88-fix6)
   // Batch counts (sirius_share_prepare): planned consumers per key, and consumers whose CTE
   // finished. Counts apply once the prepare pass reports done (counted == true); before that,
   // results publish as without counts and are held.
@@ -283,6 +284,7 @@ void publish_shared_result(std::uint64_t key,
     if (space == nullptr) { space = ro.get_memory_space(); }
   }
   std::unique_lock lk(r.mu);
+  r.producing.erase(key);
   if (r.published.count(key) != 0 || r.publishing.count(key) != 0) { return; }
   if (r.counted) {
     // Publish only if a consumer that has not finished yet will plan this key (this producer's own
@@ -365,21 +367,46 @@ void publish_shared_result(std::uint64_t key,
   r.published.emplace(key, std::move(e));
 }
 
+namespace {
+// Called with r.mu held after r.served[key] changed: drop the registry's result once every expected
+// use is served (consumers still reading keep the columns alive through their views).
+void release_if_served(registry& r, std::uint64_t key)
+{
+  if (!r.counted) { return; }
+  auto const it = r.published.find(key);
+  if (it == r.published.end() || r.served[key] < r.expected[key]) { return; }
+  sub_resident(it->second->space, it->second->bytes);
+  r.used -= it->second->bytes;
+  std::fprintf(stderr, "[share] release key=%016llx bytes=%zu served=%zu used=%zu\n",
+               static_cast<unsigned long long>(key), it->second->bytes, r.served[key], r.used);
+  r.published.erase(it);
+}
+}  // namespace
+
 void note_shared_cte_finished(std::uint64_t key)
 {
   auto& r = reg();
   std::lock_guard lk(r.mu);
-  auto const done = ++r.served[key];
-  if (!r.counted) { return; }
-  auto const it = r.published.find(key);
-  if (it == r.published.end() || done < r.expected[key]) { return; }
-  // Last expected consumer finished: drop the registry's reference (consumers still reading keep
-  // the batches alive through their own shared_ptrs) and release the resident charge.
-  sub_resident(it->second->space, it->second->bytes);
-  r.used -= it->second->bytes;
-  std::fprintf(stderr, "[share] release key=%016llx bytes=%zu served=%zu used=%zu\n",
-               static_cast<unsigned long long>(key), it->second->bytes, done, r.used);
-  r.published.erase(it);
+  r.producing.erase(key);
+  ++r.served[key];
+  release_if_served(r, key);
+}
+
+subplan_use decide_subplan_use(std::uint64_t key)
+{
+  auto& r = reg();
+  std::lock_guard lk(r.mu);
+  if (r.published.count(key) != 0) { return subplan_use::consume; }
+  auto const exp  = r.expected.count(key) != 0 ? r.expected[key] : 0;
+  auto const done = r.served.count(key) != 0 ? r.served[key] : 0;
+  if (r.producing.count(key) == 0 && r.publishing.count(key) == 0 && r.refused.count(key) == 0 &&
+      done + 2 <= exp) {
+    r.producing.insert(key);
+    return subplan_use::produce;
+  }
+  ++r.served[key];
+  release_if_served(r, key);
+  return subplan_use::inline_compute;
 }
 
 namespace {

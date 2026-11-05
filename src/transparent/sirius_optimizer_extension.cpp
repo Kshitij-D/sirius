@@ -341,7 +341,11 @@ void rewrite_shared_subplans(duckdb::OptimizerExtensionInput& input,
       if (!is_root && sirius::memory::subplan_shareable(res)) {
         auto const key = sirius::memory::subplan_share_key(res);
         if (sirius::memory::share_key_allowed(key)) {
-          hits.emplace_back(&slot, key);
+          // Rewrite only a use that will replay or publish; any other planned use stays inline
+          // (a CTE there costs a materialization barrier and the outer runtime filters).
+          if (sirius::memory::decide_subplan_use(key) != sirius::memory::subplan_use::inline_compute) {
+            hits.emplace_back(&slot, key);
+          }
           return;
         }
       }

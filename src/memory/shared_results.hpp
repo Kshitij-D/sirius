@@ -68,6 +68,14 @@ std::uint64_t combine_share_key(std::uint64_t text_key, const std::string& plan_
 /// True if the batch planner listed `key` as shared.
 bool share_key_allowed(std::uint64_t key) noexcept;
 
+/// Plan-time use of a planned subtree (subplan sharing): replay a published result, produce it for
+/// later consumers, or compute it inline as if unplanned (no CTE barrier, runtime filters kept).
+enum class subplan_use { inline_compute, produce, consume };
+
+/// Decides and records the use: claims the producer role (cleared at publish or CTE finish) and
+/// counts an inline use as served, so a published result is still released after its last reader.
+subplan_use decide_subplan_use(std::uint64_t key);
+
 /// The published result for `key`, or nullptr.
 std::shared_ptr<const shared_result> find_shared_result(std::uint64_t key);
 
